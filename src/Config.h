@@ -216,7 +216,9 @@ static const uint8_t  kZigbeeResetPin = 9;
 // If an open/close command is received in the OPPOSITE direction while the
 // actuator is still travelling, the firmware automatically transmits a STOP
 // frame first, waits kAutoStopPauseMs for motor inertia to settle, and only
-// then transmits the new direction.
+// then transmits the new direction. The same wait applies after any STOP,
+// the user's own too: a motor that has just been stopped is still coasting,
+// and a movement command that reaches it at once can cause the same error.
 //
 // "Still travelling" = within the full travel time (fully closed <-> fully
 // open) of that kind of motor (kPanels[].kind, section 1) plus

@@ -147,6 +147,7 @@ static bool stopCovers(int stopCover, int p, int m) {
 
 static int8_t   lastDirAction[kPanelCount][4];   // -1 = none / cleared by a STOP
 static uint32_t lastDirTime[kPanelCount][4];
+static uint32_t lastStopTime[kPanelCount][4];    // millis() | 1 of the last STOP frame sent for that motor; 0 = none
 
 // Defined further down but used earlier.
 static const char* resetReasonName(esp_reset_reason_t r);
@@ -814,6 +815,8 @@ static void sendFrame(uint32_t frame) {
   Serial.printf("[%lu ms] IR frame: %lu ms in all, %lu ms between the two copies (nominal %u)\n",
                 (unsigned long)millis(), (unsigned long)(millis() - t0), (unsigned long)gapMs,
                 (unsigned)velux::kRepeatGapMs);
+  trace(String("ir frame ") + (uint32_t)(millis() - t0) + " ms, gap " + gapMs + " ms (nominal " +
+        (unsigned)velux::kRepeatGapMs + ")");   // also without USB: see /api/prevlog
   irIdle();      // IR LED off until the next frame
   if (stopPendingCover < 0) delay(60);   // a gap before any next frame - but not before a STOP
 
@@ -1195,6 +1198,17 @@ static void posCommand(int p, int m, int a) {
   portEXIT_CRITICAL(&posMux);
 }
 
+// Remembers when a STOP frame for motor m (3 = all three) went out, see the
+// wait in runCommand().
+static void stampStop(int p, int m) {
+  const uint32_t t = millis() | 1;
+  if (m == 3) {
+    for (uint8_t i = 0; i < 4; ++i) lastStopTime[p][i] = t;
+  } else {
+    lastStopTime[p][m] = t;
+  }
+}
+
 // One open/stop/close command, anti-jam logic included - shared by the HTTP
 // API and Zigbee. p = panel, m = motor 0..2 or 3 = all three, a: 0 = open,
 // 1 = stop, 2 = close (index into kActions[]). Returns nullptr on success,
@@ -1246,6 +1260,7 @@ static const char* runCommand(int p, int m, int a, bool* autoStop) {
     if (needAutoStop) {
       // Actuator is actively travelling in reverse: send STOP first to prevent WLC 100 fault/lockout
       sendFrame(velux::build(velux::ACT_STOP, kMotors[m], panelCode[p]));
+      stampStop(p, m);
       posCommand(p, m, 1);   // the motor stands still during the pause
       autoStopSent = true;
       // Pause for the motor to settle - cut short, and the new direction
@@ -1254,6 +1269,23 @@ static const char* runCommand(int p, int m, int a, bool* autoStop) {
         if (stopCovers(stopPendingCover, p, m)) return "cancelled: a STOP followed";
         delay(10);
       }
+    }
+
+    // A motor that has just been stopped is still coasting - whether the STOP
+    // was the automatic one above or the user's own - and a command to move
+    // it again (in the opposite direction above all) that arrives at once
+    // is what puts the WLC 100 into its error state. So a movement command
+    // waits until kAutoStopPauseMs have passed since the last STOP for any of
+    // the motors it addresses; a STOP for it that arrives meanwhile cancels it.
+    uint32_t lastStop = 0;
+    for (uint8_t i = 0; i < 4; ++i) {
+      if (m != 3 && i != m && i != 3) continue;
+      const uint32_t t = lastStopTime[p][i];
+      if (t && (!lastStop || (int32_t)(t - lastStop) > 0)) lastStop = t;
+    }
+    while (lastStop && (uint32_t)(millis() - lastStop) < kAutoStopPauseMs) {
+      if (stopCovers(stopPendingCover, p, m)) return "cancelled: a STOP followed";
+      delay(10);
     }
 
     const uint32_t sendTime = millis();
@@ -1269,6 +1301,7 @@ static const char* runCommand(int p, int m, int a, bool* autoStop) {
   }
 
   sendFrame(velux::build(kActions[a], kMotors[m], panelCode[p]));
+  if (a == 1) stampStop(p, m);
   posCommand(p, m, a);   // position estimate: the motors now move / stand still
   if (a == 1 && stopPendingCover == p * 4 + m) stopPendingCover = -1;   // the STOP has gone out
   if (autoStop) *autoStop = autoStopSent;
