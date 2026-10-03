@@ -320,7 +320,7 @@ between.
 |---|---|---|
 | Wi-Fi off unless the switch is ON | `kWifiSwitchPin` | the biggest saving |
 | Sleepy Zigbee, polling every 1 s | `kZigbeePollMs` | longer = less power, slower commands |
-| Light sleep + DFS | `kEnablePowerManagement` | the chip naps between radio wake-ups; at rest the clock sits at 40 MHz and rises to 80 MHz while handling a packet or an IR frame |
+| Light sleep | `kEnablePowerManagement` | the chip naps between radio wake-ups, with the clock at 80 MHz (below that the Zigbee link breaks, see `kCpuFreqIdleMinMhz`) |
 | Bluetooth and Thread compiled out | `platformio.ini` | smaller image, nothing running |
 | IR LED powered only by the signal | — | no idle draw from the transmitter driver |
 | Battery read once a minute | — | 7-day history in flash |
@@ -329,7 +329,7 @@ between.
 **Switch "USB log" off** (Settings): while it is on, light sleep stays off so
 the USB console works, and the board draws ~15 mA — about a week of battery.
 With it off, Settings → Device → **Power management** reads `light sleep +
-DFS 40-80 MHz` (`160 MHz` with Wi-Fi on). A side effect: with light sleep the
+DFS 80 MHz` (`160 MHz` with Wi-Fi on). A side effect: with light sleep the
 chip's USB port switches off, so the COM port disappears (see
 Troubleshooting).
 
@@ -366,10 +366,11 @@ Everything you are likely to change lives in one file, in numbered sections:
    **Measure your actuators with a stopwatch and enter the real values**: they
    drive both the anti-jam protection and the position estimate.
 5. **Power saving** — the CPU clock (`kCpuFreqBootMhz` 160, `kCpuFreqWifiMhz`
-   160, `kCpuFreqMhz` 80, `kCpuFreqIdleMinMhz` 40; boot always runs at full
+   160, `kCpuFreqMhz` 80, `kCpuFreqIdleMinMhz` 80; boot always runs at full
    speed, then Wi-Fi mode stays at the maximum and Zigbee-only floats between
-   the minimum and `kCpuFreqMhz`), `kEnablePowerManagement`, and the USB log
-   default.
+   the minimum and `kCpuFreqMhz` - keep the minimum at 80: at 40 MHz the Zigbee
+   link breaks and no command arrives), `kEnablePowerManagement`, and the USB
+   log default.
 6. **Battery** — pin, divider, calibration (measure the cell with a
    multimeter and set `kBatteryCalibration` to *real ÷ shown*), capacity.
 7. **Zigbee** — first endpoint, manufacturer ("VELUX") and model ("WLI 130
@@ -414,6 +415,7 @@ network, never port-forward it.
 | POST | `/api/log/clear` | clears the frame log |
 | GET | `/api/crashlog` | the crash log, oldest first, and `safeMode` |
 | POST | `/api/crashlog/clear` | clears it (and ends the safe mode) |
+| GET | `/api/prevlog` | the log of the run before this one (`boot`, and `lines` with `ms` since that run started and `t` the text), oldest first |
 | POST | `/api/crashtest?kind=exception|panic|terminate` | provokes a fault on purpose, to check the crash log |
 | POST | `/api/wifi` | `{"ssid":"…","pass":"…"}`, then reboots |
 | GET | `/api/wifiscan` | nearby networks |
@@ -473,14 +475,25 @@ just happening:
   crash log (Log tab) to leave safe mode; a run of `kCrashStableMs` (10 min)
   without a crash resets the count by itself.
 
+**The log of the previous run.** The frame log lives in RAM and is gone at every
+restart - including the one that follows switching the Wi-Fi switch back on after
+a session without Wi-Fi, which has neither web UI nor (with the USB log off)
+serial. So every log line, plus a few trace lines (boot and reset reason, mode,
+power configuration, Zigbee joined / lost, every command received from the
+network, a sign of life every 30 s), is also kept in **RTC memory**, which
+survives software restarts and crashes (not a power loss). `GET /api/prevlog`
+returns the run before the current one: to find out what the board did in
+Zigbee-only mode, switch Wi-Fi on afterwards and read it. The last 96 lines are
+kept.
+
 **Decoding an entry.** The addresses (`pc`, `ra`, the backtrace) are code
 locations in the firmware. Decode them on the PC with the `.elf` file of
-**the same build** (`.piouildirebeetle2_c6irmware.elf` - keep a copy with
+**the same build** (`.pio\build\firebeetle2_c6\firmware.elf` - keep a copy with
 every release you flash):
 
 ```powershell
-& "$env:USERPROFILE.platformiopackages	oolchain-riscv32-espiniscv32-esp-elf-addr2line.exe" `
-  -pfiaC -e .piouildirebeetle2_c6irmware.elf 0x42015628 0x4200c288
+& "$env:USERPROFILE\.platformio\packages\toolchain-riscv32-esp\bin\riscv32-esp-elf-addr2line.exe" `
+  -pfiaC -e .pio\build\firebeetle2_c6\firmware.elf 0x42015628 0x4200c288
 ```
 
 prints the function and source line of each address. The backtrace is taken

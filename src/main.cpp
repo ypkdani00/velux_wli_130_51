@@ -186,9 +186,10 @@ static void setupPowerManagement() {
     pmStatus = "off (USB log on)";
     return;
   }
-  // Wi-Fi on: fixed at the maximum. Zigbee only: floats from the lowest clock
-  // (the crystal, 40MHz) at rest up to kCpuFreqMhz while there is work -
-  // a Zigbee packet, an IR frame (PmBusy) - and goes back down by itself.
+  // Wi-Fi on: fixed at the maximum. Zigbee only: floats between
+  // kCpuFreqIdleMinMhz and kCpuFreqMhz (both 80 by default: lower breaks the
+  // Zigbee link, see Config.h) - up for a Zigbee packet or an IR frame
+  // (PmBusy), and back down by itself.
   esp_pm_config_t cfg = {};
   cfg.max_freq_mhz = wifiEnabled ? kCpuFreqWifiMhz : kCpuFreqMhz;
   cfg.min_freq_mhz = wifiEnabled ? kCpuFreqWifiMhz : kCpuFreqIdleMinMhz;
@@ -468,8 +469,62 @@ static const char* panelBySecurity(uint16_t sec) {
   return nullptr;
 }
 
+// ------------------------------ log of the previous run ---------------------
+//
+// The frame log lives in RAM and is gone at every restart - including the one
+// that follows switching the Wi-Fi switch back on after a session without
+// Wi-Fi (and with the USB log off, so no serial either), which is exactly when
+// one wants to know what happened in it. So every log line, plus a few trace
+// lines, is also kept in RTC memory: it survives software restarts and crashes
+// (not a power loss). At boot the run before this one is copied out of it:
+// GET /api/prevlog.
+static const uint16_t kRtcLogLines = 96;
+static const uint32_t kRtcLogMagic = 0x564C5802;   // "VLX" + layout version
+
+struct RtcLogLine {
+  uint32_t ms;       // millis() of that run
+  char     text[60];
+};
+struct RtcLog {
+  uint32_t magic;
+  uint32_t boot;     // run number since the memory was last cleared
+  uint16_t head;     // next slot to write
+  uint16_t count;    // valid lines
+  RtcLogLine line[kRtcLogLines];
+};
+RTC_NOINIT_ATTR static RtcLog rtcLog;
+static RtcLog prevLog;   // the run before this one (boot == 0: none)
+
+// At boot, before anything is logged.
+static void rtcLogInit() {
+  const bool valid = esp_reset_reason() != ESP_RST_POWERON && rtcLog.magic == kRtcLogMagic &&
+                     rtcLog.head < kRtcLogLines && rtcLog.count <= kRtcLogLines;
+  if (valid) memcpy(&prevLog, &rtcLog, sizeof prevLog);
+  else       memset(&prevLog, 0, sizeof prevLog);
+  const uint32_t boot = valid ? rtcLog.boot + 1 : 1;
+  memset(&rtcLog, 0, sizeof rtcLog);
+  rtcLog.magic = kRtcLogMagic;
+  rtcLog.boot  = boot;
+}
+
+// Call with logLock held.
+static void rtcLogAdd(const char* text) {
+  RtcLogLine& l = rtcLog.line[rtcLog.head];
+  l.ms = millis();
+  strlcpy(l.text, text, sizeof l.text);
+  rtcLog.head = (rtcLog.head + 1) % kRtcLogLines;
+  if (rtcLog.count < kRtcLogLines) ++rtcLog.count;
+}
+
+// A line for the previous-run log only (not for the frame log).
+static void trace(const String& s) {
+  LogGuard guard;
+  rtcLogAdd(s.c_str());
+}
+
 static void pushLog(const String& line) {
   LogGuard guard;
+  rtcLogAdd(line.c_str());
   if (logCount == kLogEntries) {   // full: the oldest entry makes room
     for (uint8_t i = 0; i < kLogEntries - 1; ++i) {
       logLines[i] = logLines[i + 1];
@@ -1351,6 +1406,27 @@ static void handleCrashTest() {
   *(volatile int*)0 = 1;
 }
 
+// {"boot":N,"lines":[{"ms":..,"t":".."},...]}: the log of the run before this
+// one, oldest first (ms = millis() of that run); boot 0 = nothing kept.
+static void handlePrevLog() {
+  String j = "{\"boot\":";
+  j += prevLog.boot;
+  j += ",\"lines\":[";
+  const uint16_t n = prevLog.count;
+  const uint16_t start = (n == kRtcLogLines) ? prevLog.head : 0;
+  for (uint16_t k = 0; k < n; ++k) {
+    const RtcLogLine& l = prevLog.line[(start + k) % kRtcLogLines];
+    if (k) j += ',';
+    j += "{\"ms\":";
+    j += l.ms;
+    j += ",\"t\":\"";
+    j += jsonEscape(String(l.text));
+    j += "\"}";
+  }
+  j += "]}";
+  sendJson(j);
+}
+
 static void handleCrashLogClear() {
   prefs.begin("crash", false);
   prefs.clear();   // the history, the counters - and so the safe mode
@@ -1656,6 +1732,7 @@ static void setupHttp() {
   route("/api/wifiscan",  HTTP_GET,  handleWifiScan);
   server.on("/api/update",    HTTP_POST, handleFirmwareResult, handleFirmwareUpload);
   route("/api/log/clear", HTTP_POST, [] { logCount = 0; sendJson("{\"ok\":true}"); });
+  route("/api/prevlog",        HTTP_GET,  handlePrevLog);
   route("/api/crashlog",       HTTP_GET,  handleCrashLog);
   route("/api/crashlog/clear", HTTP_POST, handleCrashLogClear);
   route("/api/crashtest",      HTTP_POST, handleCrashTest);
@@ -1922,6 +1999,7 @@ static void zbEnqueue(uint8_t cover, uint8_t action) {
   zbTouch();
   Serial.printf("[%lu ms] Zigbee: command received from the network (cover %u, action %u)\n",
                 (unsigned long)millis(), cover, action);
+  trace(String("zb rx cover ") + cover + " action " + action);
   const ZbCommand c = {cover, action};
   if (!zbQueue) return;
   if (action != 1) { xQueueSend(zbQueue, &c, 0); return; }
@@ -2251,6 +2329,7 @@ static void handleZigbeePoll() {
     joinedAt = now ? now : 1;
     usbLogReports = 0;
   }
+  if (connected != wasConnected) trace(connected ? "zigbee: joined" : "zigbee: not connected");
   wasConnected = connected;
   if (!connected) return;
   // After every (re)join the "USB log" switch tells Home Assistant where it
@@ -2273,6 +2352,17 @@ static void handleZigbeePoll() {
     turboFor = zbActiveAt;
     zbStartTurboPoll();
   }
+}
+
+// A sign of life every 30 s in the previous-run log: how long the board kept
+// running, at what clock, and whether Zigbee was joined.
+static void handleHeartbeat() {
+  static uint32_t last = 0;
+  const uint32_t now = millis();
+  if (last && (uint32_t)(now - last) < 30000) return;
+  last = now ? now : 1;
+  trace(String("alive, up ") + now / 1000 + " s, " + getCpuFrequencyMhz() + " MHz, heap " + ESP.getFreeHeap() +
+        ", zigbee " + (zbStarted ? (Zigbee.connected() ? "joined" : "not joined") : "off"));
 }
 
 // Battery % (and voltage) to the coordinator: right after joining, then
@@ -2415,6 +2505,7 @@ void setup() {
   posRestore();                                   // ...unless a restart left one behind
   cmdLock  = xSemaphoreCreateRecursiveMutex();
   logLock  = xSemaphoreCreateMutex();
+  rtcLogInit();                                   // keeps the run before this one, starts a new log
   loopTask = xTaskGetCurrentTaskHandle();
 
   // Boot runs at full speed (kCpuFreqBootMhz): Wi-Fi, Zigbee and the web
@@ -2474,6 +2565,9 @@ void setup() {
   ledLit = true;
   pinMode(kZigbeeResetPin, INPUT_PULLUP);
   Serial.printf("Mode: %s\n", wifiEnabled ? "Wi-Fi ON (web UI, HTTP API, OTA)" : "Zigbee only, Wi-Fi off");
+  trace(String("boot #") + rtcLog.boot + ": " + resetReasonName(esp_reset_reason()) + ", " +
+        (wifiEnabled ? "Wi-Fi" : "Zigbee only") + ", USB log " + (usbLog ? "on" : "off") +
+        (crashSafeMode ? ", SAFE MODE" : ""));
 
   if (wifiEnabled) {
     setupWifi();
@@ -2514,6 +2608,8 @@ void setup() {
   if (!pmBusyLock) setCpuFrequencyMhz(wifiEnabled ? kCpuFreqWifiMhz : kCpuFreqMhz);
   Serial.printf("Power management: %s\n", pmStatus.c_str());
   Serial.printf("CPU frequency: %u MHz (boot at %u MHz)\n", getCpuFrequencyMhz(), (unsigned)kCpuFreqBootMhz);
+  trace(String("PM: ") + pmStatus + ", " + getCpuFrequencyMhz() + " MHz, Zigbee " +
+        (zbStarted ? (Zigbee.connected() ? "joined" : "not joined yet") : "off"));
 
   statusLedBooted = true;   // from now on the LED shows the Zigbee state
   handleStatusLed();
@@ -2557,6 +2653,7 @@ static void loopOnce() {
   handleZigbeeReset();
   handleZigbeeBattery();
   handleZigbeePoll();
+  handleHeartbeat();
   handlePositions();
   handlePositionSave();
   handleStatusLed();

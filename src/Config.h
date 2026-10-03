@@ -237,22 +237,24 @@ static const uint16_t kAutoStopPauseMs    = 1000;
 //    on anyway).
 //  - Zigbee only (the battery mode): the clock floats between
 //    kCpuFreqIdleMinMhz at rest and kCpuFreqMhz while a Zigbee packet or an IR
-//    frame is being handled, then goes back down. 40MHz is the crystal clock,
-//    the lowest the chip supports. The IR frames are timed by the RMT
-//    peripheral, independent of the CPU clock.
+//    frame is being handled, then goes back down. Keep kCpuFreqIdleMinMhz at
+//    80: measured on this board, with the clock at 40MHz (the crystal, the
+//    lowest the chip supports) the Zigbee link breaks for good - a ZDO request
+//    to the coordinator gets no answer, so no command ever arrives - while
+//    light sleep at a fixed 80 or 160MHz works fine. The IR frames are timed
+//    by the RMT peripheral, independent of the CPU clock.
 // The floating clock needs power management (kEnablePowerManagement) and
 // the USB log off; with the USB log on the clock stays at kCpuFreqMhz.
 static const uint8_t kCpuFreqBootMhz    = 160;
 static const uint8_t kCpuFreqWifiMhz    = 160;
 static const uint8_t kCpuFreqMhz        = 80;
-static const uint8_t kCpuFreqIdleMinMhz = 40;
+static const uint8_t kCpuFreqIdleMinMhz = 80;   // not lower: see above
 
 
 // Automatic light sleep + DFS (dynamic frequency scaling), via the ESP-IDF
-// power management API. When nothing is happening the chip drops its clock
-// to kCpuFreqIdleMinMhz (Zigbee-only mode) and, between radio wake-ups, goes
-// into light sleep while staying connected to the Zigbee parent / the
-// router. This is the setting that decides between "days" and "months" on
+// power management API. Between radio wake-ups the chip goes into light sleep
+// while staying connected to the Zigbee parent / the router (and, if
+// kCpuFreqIdleMinMhz is below kCpuFreqMhz, drops its clock when idle). This is the setting that decides between "days" and "months" on
 // a battery.
 // platformio.ini builds the ESP-IDF libraries with it enabled
 // (custom_sdkconfig); Settings -> Device shows whether it's running.
