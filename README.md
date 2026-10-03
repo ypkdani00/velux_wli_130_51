@@ -28,6 +28,7 @@ off and the battery lasts months.
 - [IR protocol](#ir-protocol)
 - [HTTP API](#http-api)
 - [Firmware updates and flashing](#firmware-updates-and-flashing)
+- [Crashes](#crashes)
 - [Troubleshooting](#troubleshooting)
 - [Project layout](#project-layout)
 
@@ -203,7 +204,21 @@ for "all three" (endpoint = `kZigbeeFirstEndpoint` + keypad × 4 + motor):
 | 13 | All windows |
 | 14, 15, 16 | Blind 1, 2, 3 |
 | 17 | All blinds |
+| 30 | USB log (On/Off switch, see below) |
 
+- **USB log switch.** Endpoint 30 is an On/Off switch for the same setting as
+  Settings → USB log, so the console can be turned on or off without Wi-Fi.
+  The two are one stored setting and follow each other: change it in the web
+  UI and the switch in Home Assistant follows; change the switch and the
+  setting is stored and **the board restarts** to apply it (the console and
+  light sleep are set up at boot; the position estimate is lost with the
+  restart). The board does not push its state to Home Assistant after a
+  restart (an explicit report of the On/Off attribute aborts inside the
+  stack), so if the switch shows the wrong state, press the other position
+  first, then the one you want. Adding this endpoint to an already paired
+  board needs a
+  **Reconfigure** of the device in ZHA (or a new pairing) before the switch
+  shows up.
 - **Pairing** is started from the web UI (**Settings → Zigbee → Start
   pairing**) with the coordinator in permit-join mode, and works only while
   the Wi-Fi switch is ON. **Forget network** (or BOOT for 3 s) undoes it.
@@ -216,9 +231,12 @@ for "all three" (endpoint = `kZigbeeFirstEndpoint` + keypad × 4 + motor):
   23 s, `kTravelTimeBlindMs` = 25 s): an actuator moves at constant speed, an
   open / close starts the estimate, a STOP freezes it, the end of travel
   stops it there. Home Assistant gets it **every second while a motor runs**;
-  "All windows / All blinds" show the average. At boot it is unknown (50%)
-  and after one full run it is right again; every full run corrects any
-  drift. The reported value stays between 1% and 99%, never exactly 0% or
+  "All windows / All blinds" have a position of their own and follow only the
+  commands sent to them: moving one window by itself leaves "All windows"
+  alone, while an "all" command moves the three windows too. The estimate is
+  stored when the motors stop and restored after a restart (a reboot changes
+  nothing in Home Assistant); only the very first start is a guess (50%), and
+  after one full run it is right again. Every full run corrects any drift. The reported value stays between 1% and 99%, never exactly 0% or
   100%: Home Assistant greys out the open (close) button of a cover it
   believes fully open (closed), and opening or closing again must always be
   possible.
@@ -273,12 +291,13 @@ while hidden: every request wakes the radio).
   The anti-jam cooldown does not apply to raw frames.
 - **Log** — two sections, each with **Clear** and **Export JSON / TXT** (the
   file is built in the browser):
-  - **Frame log** — the commands: the last 16 (`kLogEntries`), in RAM (lost
+  - **Frame log** — the commands: the last 32 (`kLogEntries`), in RAM (lost
     at a restart): transmitted IR frames decoded (action, motor, security
     code, checksum) and commands received over Zigbee (**ZB**), each with its
     time (`dd/mm hh:mm:ss`, Rome time by default).
   - **Battery history** — one reading every 2 hours (and at each restart) for
     7 days, kept in flash across restarts, with the drain in %/day.
+  - **Crash log** — the restarts caused by a crash, in flash (see "Crashes").
 - **Wi-Fi** — connection status, **Scan networks**, **Join manually** (hidden
   networks) and the **Access point password** of the setup network.
 - **Settings** — **Firmware update**, **Zigbee** (Start pairing / Forget
@@ -357,6 +376,8 @@ Everything you are likely to change lives in one file, in numbered sections:
    IR"), sleepy or not, position-report limits, poll interval, battery report
    interval, and the **task priorities** (`kCmdTaskPriority` 21,
    `kZigbeeTaskPriority` 20).
+8. **Reliability** — `kLowHeapBytes`, `kCrashLoopLimit`, `kCrashStableMs`
+   (see "Crashes").
 
 ## IR protocol
 
@@ -391,6 +412,9 @@ network, never port-forward it.
 | GET | `/api/battery/history` | the week of readings, oldest first: `{"t","up","mv","pct","boot"}` |
 | POST | `/api/battery/history/clear` | deletes it |
 | POST | `/api/log/clear` | clears the frame log |
+| GET | `/api/crashlog` | the crash log, oldest first, and `safeMode` |
+| POST | `/api/crashlog/clear` | clears it (and ends the safe mode) |
+| POST | `/api/crashtest?kind=exception|panic|terminate` | provokes a fault on purpose, to check the crash log |
 | POST | `/api/wifi` | `{"ssid":"…","pass":"…"}`, then reboots |
 | GET | `/api/wifiscan` | nearby networks |
 | POST | `/api/appassword` | `{"pass":"…"}` for the setup AP (8–63 chars, or empty = default), then reboots |
@@ -424,6 +448,50 @@ curl -X POST "http://velux.local/api/send?panel=1&motor=3&action=2"   # close al
 - Build from PowerShell / VS Code, not Git Bash (ESP-IDF's tools refuse to
   run under MSYS). Only the first build, and any change to `platformio.ini`,
   takes minutes.
+
+## Crashes
+
+A restart caused by a crash - a CPU exception (null pointer, bad access), a
+watchdog, a brownout, a stack overflow - is **recorded and shown** instead of
+just happening:
+
+- ESP-IDF writes a **core dump** to the `coredump` partition before it reboots.
+  At the next boot the firmware reads its summary - the **task** that crashed,
+  the **program counter**, the **cause**, the return addresses found on its
+  stack - keeps it in flash (the last 10, across restarts) and erases the dump.
+  They appear in **Log → Crash log** (Clear, Export JSON / TXT), in the USB log
+  and in the frame log (`!!  Restarted after a crash`).
+- **C++ exceptions** thrown in the main loop or in a Zigbee command are
+  **caught and logged** (`!!  Exception caught: …`) and the board carries on.
+  One that nothing catches ends in a panic, recorded with its text.
+- **Low memory**: free heap below `kLowHeapBytes` for 30 s restarts the board on
+  purpose (recorded) before it runs out of memory altogether.
+- **Crash loop → safe mode.** After `kCrashLoopLimit` (3) crashes in a row the
+  board starts in **safe mode**: Wi-Fi forced on whatever the switch says,
+  Zigbee off, the status LED pulsing like Identify - so you can read the log and
+  update the firmware instead of watching it reboot for ever. **Clear** the
+  crash log (Log tab) to leave safe mode; a run of `kCrashStableMs` (10 min)
+  without a crash resets the count by itself.
+
+**Decoding an entry.** The addresses (`pc`, `ra`, the backtrace) are code
+locations in the firmware. Decode them on the PC with the `.elf` file of
+**the same build** (`.piouildirebeetle2_c6irmware.elf` - keep a copy with
+every release you flash):
+
+```powershell
+& "$env:USERPROFILE.platformiopackages	oolchain-riscv32-espiniscv32-esp-elf-addr2line.exe" `
+  -pfiaC -e .piouildirebeetle2_c6irmware.elf 0x42015628 0x4200c288
+```
+
+prints the function and source line of each address. The backtrace is taken
+from the raw stack (RISC-V cannot unwind on the chip), so a few entries may be
+stale values - the first ones are the most reliable.
+
+**Testing it.** With the Wi-Fi switch ON, `POST /api/crashtest?kind=exception`
+throws an exception (caught, logged, the board carries on), `kind=panic`
+writes to address 0 (a real CPU exception) and `kind=terminate` throws one
+nobody catches; the last two restart the board and leave an entry. Three
+panics in a row start the safe mode.
 
 ## Troubleshooting
 

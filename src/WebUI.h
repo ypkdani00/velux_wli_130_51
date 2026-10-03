@@ -217,6 +217,16 @@ footer{padding:0 16px 22px;text-align:center;font-size:11.5px;color:var(--mut)}
         <button class="btn sec" style="flex:1" onclick="exportBat('txt')">Export TXT</button>
       </div>
     </div>
+    <div class="card">
+      <div class="ctitle"><h2>Crash log</h2><button class="btn ghost" onclick="clearCrashLog()">Clear</button></div>
+      <p class="sub" id="crSub">Restarts after a crash (panic, watchdog, brownout, low memory), kept in flash across restarts.</p>
+      <div id="cr"></div>
+      <div class="row" style="display:flex;gap:8px;margin-top:10px">
+        <button class="btn sec" style="flex:1" onclick="exportCrash('json')">Export JSON</button>
+        <button class="btn sec" style="flex:1" onclick="exportCrash('txt')">Export TXT</button>
+      </div>
+      <p class="mini">Decode the addresses with the firmware's .elf file (see the README, "Crashes").</p>
+    </div>
   </section>
 
   <section class="view" id="v-wifi" role="tabpanel" aria-labelledby="t-wifi">
@@ -327,7 +337,7 @@ function selectTab(b,focus){
     x.classList.toggle('on',on);x.setAttribute('aria-selected',on?'true':'false');x.tabIndex=on?0:-1;
   });
   ['control','log','wifi','adv'].forEach(function(v){$('v-'+v).classList.toggle('on',v===b.dataset.v);});
-  if(b.dataset.v==='log')loadBatHistory();   // fetched on demand, not on every poll
+  if(b.dataset.v==='log'){loadBatHistory();loadCrashLog();}   // fetched on demand, not on every poll
   if(focus)b.focus();
 }
 
@@ -382,6 +392,49 @@ function exportBat(kind){
     mime='text/plain';
   }
   saveFile('velux-battery',kind,body,mime);
+}
+// Crash log (Log tab): the last restarts caused by a crash, newest first.
+var crData={safeMode:false,entries:[]};
+function hex8(n){return '0x'+('00000000'+(n>>>0).toString(16)).slice(-8);}
+function crWhen(e){return e.t?new Date(e.t*1000).toLocaleString():'time unknown';}
+async function loadCrashLog(){
+  var r=await api('/api/crashlog','GET',null,8000);
+  if(!r||!Array.isArray(r.entries))return;
+  crData=r;
+  var n=r.entries.length;
+  $('crSub').textContent=(r.safeMode?'SAFE MODE: the board crashed repeatedly, so Wi-Fi is forced on and Zigbee is off. Update the firmware, then clear this log. ':'')
+    +(n?(r.total+' crash'+(r.total===1?'':'es')+' since the log was cleared; the last '+n+' are shown.'):'No crashes recorded.');
+  $('cr').innerHTML=r.entries.slice().reverse().map(function(e){
+    return '<div class="kv" style="display:block"><div><b>'+esc(e.reasonText)+'</b> &middot; '+esc(crWhen(e))+'</div>'
+      +'<div class="mini">task '+esc(e.task)+(e.text?' &middot; '+esc(e.text):'')+'</div>'
+      +(e.pc?'<div class="mini">pc '+hex8(e.pc)+' &middot; ra '+hex8(e.ra)+' &middot; cause '+hex8(e.mcause)
+        +'<br>backtrace: '+(e.bt.length?e.bt.map(hex8).join(' '):'-')+'</div>':'')+'</div>';
+  }).join('');
+}
+function exportCrash(kind){
+  if(!crData.entries.length){alert('No crashes recorded: nothing to export.');return;}
+  var body,mime;
+  if(kind==='json'){
+    body=JSON.stringify({device:'VELUX WLI 130 IR',firmware:st.version||'',exported:new Date().toISOString(),
+      safeMode:crData.safeMode,total:crData.total,crashes:crData.entries.map(function(e){
+        return {time:e.t?new Date(e.t*1000).toISOString():'',reason:e.reasonText,task:e.task,text:e.text,
+                pc:hex8(e.pc),ra:hex8(e.ra),mcause:hex8(e.mcause),mtval:hex8(e.mtval),backtrace:e.bt.map(hex8)};
+      })},null,2);
+    mime='application/json';
+  }else{
+    body=crData.entries.map(function(e){
+      return crWhen(e)+'  '+e.reasonText+'  task '+e.task+(e.text?'  '+e.text:'')
+        +'\n    pc '+hex8(e.pc)+'  ra '+hex8(e.ra)+'  cause '+hex8(e.mcause)+'\n    backtrace '+e.bt.map(hex8).join(' ');
+    }).join('\n')+'\n';
+    mime='text/plain';
+  }
+  saveFile('velux-crash',kind,body,mime);
+}
+async function clearCrashLog(){
+  if(!confirm('Delete the crash log? This also ends the safe mode, if it is on.'))return;
+  var r=await api('/api/crashlog/clear','POST');
+  if(r.error){alert(r.error);return;}
+  loadCrashLog();
 }
 async function clearBatHistory(){
   if(!confirm('Delete the stored battery history? A fresh reading is taken again every 2 hours.'))return;

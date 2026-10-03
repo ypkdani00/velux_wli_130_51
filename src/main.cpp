@@ -45,6 +45,9 @@
 #include <esp_system.h>   // esp_reset_reason(), for the boot diagnostics below
 #include <esp_wifi.h>     // esp_wifi_set_bandwidth(), for kWifiNarrowBandwidth
 #include <esp_sntp.h>     // NTP reply callback, see clockFromNtp
+#include <esp_core_dump.h> // what a crash left in flash, see "crash log"
+#include <exception>
+#include <stdexcept>
 #include <esp_pm.h>      // automatic light sleep / DFS, for kEnablePowerManagement
 #include <lwip/sockets.h> // select() on the server sockets, see waitForWork()
 #include <Update.h>       // in-place firmware flashing from an uploaded .bin
@@ -149,6 +152,7 @@ static uint32_t lastDirTime[kPanelCount][4];
 static const char* resetReasonName(esp_reset_reason_t r);
 static const char* zigbeeStatus();
 static bool usbLogSaved();
+static String positionsJson();   // see "position estimate"
 static bool zbPairedFlag();     // the network was joined once (stored in NVS)
 static bool zigbeePairing();    // stack running, not (yet) on a network
 static bool zbRequestPair();    // web UI: start the stack / the search for a network
@@ -481,6 +485,170 @@ static void pushLog(const String& line) {
   ++logCount;
 }
 
+// ------------------------------ crash log -----------------------------------
+//
+// A restart after a crash - a CPU exception (panic), a watchdog, a brownout, a
+// stack overflow - leaves a core dump in flash (the "coredump" partition,
+// written by ESP-IDF before it reboots). At the next boot its summary - the
+// task, the program counter, the backtrace, the reason - is read, erased and
+// kept in NVS: the last kCrashHistory, shown in the Log tab and exported.
+// The addresses are decoded on the PC (see the README, "Crashes").
+//
+// Around that: an uncaught C++ exception ends in a panic like any other
+// crash, but with its text; a long shortage of free heap restarts the board
+// on purpose; and after kCrashLoopLimit crashes in a row it starts in SAFE
+// MODE - Wi-Fi on, Zigbee off - so the log can be read and the firmware
+// replaced instead of the board rebooting for ever.
+static const uint8_t kCrashHistory      = 10;
+static const uint8_t kCrashReasonLowMem = 100;   // beyond esp_reset_reason_t
+
+struct CrashRecord {
+  uint32_t time;      // Unix time of the boot that found it; 0 = clock not set
+  uint8_t  reason;    // esp_reset_reason_t, or kCrashReason*
+  uint8_t  depth;     // valid entries in bt[]
+  uint16_t reserved;
+  uint32_t pc, mcause, mtval, ra;
+  char     task[16];  // the task that crashed
+  char     text[72];  // the panic reason, the exception text...
+  uint32_t bt[12];    // backtrace of that task
+};
+
+static bool crashSafeMode = false;   // too many crashes in a row: Wi-Fi on, Zigbee off
+static uint8_t crashInARow = 0;      // crashes in a row up to this boot (0 = the last run did not crash)
+
+static void crashStore(const CrashRecord& r) {
+  prefs.begin("crash", false);
+  const uint8_t head = prefs.getUChar("head", 0) % kCrashHistory;
+  char key[4];
+  snprintf(key, sizeof key, "c%u", (unsigned)head);
+  prefs.putBytes(key, &r, sizeof r);
+  prefs.putUChar("head", (head + 1) % kCrashHistory);
+  prefs.putUInt("count", prefs.getUInt("count", 0) + 1);
+  prefs.end();
+}
+
+// Restart on purpose because of a fault we noticed ourselves.
+static void crashRestart(uint8_t reason, const String& text) {
+  CrashRecord r = {};
+  r.time = clockSet() ? (uint32_t)time(nullptr) : 0;
+  r.reason = reason;
+  strlcpy(r.task, "main", sizeof r.task);
+  strlcpy(r.text, text.c_str(), sizeof r.text);
+  crashStore(r);
+  prefs.begin("crash", false);
+  prefs.putUChar("loop", prefs.getUChar("loop", 0) + 1);
+  prefs.end();
+  Serial.println("Restarting: " + text);
+  Serial.flush();
+  restartBoard();
+}
+
+// Called from std::terminate (an uncaught C++ exception): remember the text,
+// then abort - the panic that follows is picked up at the next boot.
+static void crashTerminate() {
+  char text[72] = "uncaught C++ exception";
+  try {
+    if (std::current_exception()) std::rethrow_exception(std::current_exception());
+  } catch (const std::exception& e) {
+    strlcpy(text, e.what(), sizeof text);
+  } catch (...) {
+  }
+  prefs.begin("crash", false);
+  prefs.putString("exc", text);
+  prefs.end();
+  abort();
+}
+
+// At boot, after the clock and the logs are up. Records a crash if the last
+// restart was one, and decides about safe mode.
+static void crashInit() {
+  const esp_reset_reason_t rr = esp_reset_reason();
+  const bool crashed = rr == ESP_RST_PANIC || rr == ESP_RST_INT_WDT || rr == ESP_RST_TASK_WDT ||
+                       rr == ESP_RST_WDT || rr == ESP_RST_BROWNOUT;
+  prefs.begin("crash", false);
+  uint8_t inARow = prefs.getUChar("loop", 0);
+  const String exc = prefs.getString("exc", "");
+  if (exc.length()) prefs.remove("exc");
+  prefs.end();
+
+  if (crashed) {
+    CrashRecord r = {};
+    r.time = clockSet() ? (uint32_t)time(nullptr) : 0;
+    r.reason = (uint8_t)rr;
+    strlcpy(r.task, "?", sizeof r.task);
+    strlcpy(r.text, exc.c_str(), sizeof r.text);
+    if (esp_core_dump_image_check() == ESP_OK) {
+      esp_core_dump_summary_t* s = (esp_core_dump_summary_t*)malloc(sizeof(esp_core_dump_summary_t));
+      if (s && esp_core_dump_get_summary(s) == ESP_OK) {
+        strlcpy(r.task, s->exc_task, sizeof r.task);
+        r.pc = s->exc_pc;
+        r.mcause = s->ex_info.mcause;
+        r.mtval = s->ex_info.mtval;
+        r.ra = s->ex_info.ra;
+        // On RISC-V the dump holds the raw stack of the crashed task, not an
+        // unwound backtrace. Words that point into the flash-mapped code are
+        // the likely return addresses: kept as the backtrace (decode them on
+        // the PC; some are stale values left on the stack).
+        const uint32_t* words = (const uint32_t*)s->exc_bt_info.stackdump;
+        const uint32_t nWords = s->exc_bt_info.dump_size / 4;
+        for (uint32_t i = 0; i < nWords && r.depth < 12; ++i)
+          if (words[i] >= 0x42000000u && words[i] < 0x43000000u) r.bt[r.depth++] = words[i];
+      }
+      free(s);
+      if (!r.text[0]) {
+        char why[72];
+        if (esp_core_dump_get_panic_reason(why, sizeof why) == ESP_OK) strlcpy(r.text, why, sizeof r.text);
+      }
+      esp_core_dump_image_erase();
+    }
+    if (!r.text[0] && r.pc) {   // no panic text: name the RISC-V trap cause
+      static const char* const kCause[] = {
+        "instruction address misaligned", "instruction access fault", "illegal instruction", "breakpoint",
+        "load address misaligned", "load access fault", "store address misaligned", "store access fault"};
+      if (r.mcause < sizeof kCause / sizeof kCause[0]) strlcpy(r.text, kCause[r.mcause], sizeof r.text);
+    }
+    if (!r.text[0]) strlcpy(r.text, "no further details", sizeof r.text);
+    crashStore(r);
+    ++inARow;
+    prefs.begin("crash", false);
+    prefs.putUChar("loop", inARow);
+    prefs.end();
+    Serial.printf("CRASH at the last run: %s, task %s, pc 0x%08lx - %s\n", resetReasonName(rr), r.task,
+                  (unsigned long)r.pc, r.text);
+    pushLog(String("!!  Restarted after a crash: ") + resetReasonName(rr) + ", task " + r.task);
+  }
+  crashInARow = inARow;
+  crashSafeMode = inARow >= kCrashLoopLimit;
+  if (crashSafeMode) {
+    Serial.printf("SAFE MODE: %u crashes in a row - Wi-Fi on, Zigbee off. Read the crash log, update the firmware, "
+                  "then clear the log.\n", (unsigned)inARow);
+    pushLog("!!  SAFE MODE: crash loop - Wi-Fi on, Zigbee off");
+  }
+}
+
+// Every 10 s: a run of kCrashStableMs without a crash ends the "in a row"
+// count, and a long shortage of free heap restarts the board (and leaves a
+// record) before it runs out of memory altogether.
+static void handleHealth() {
+  static uint32_t last = 0;
+  static uint8_t  low = 0;
+  static bool     stable = false;
+  const uint32_t now = millis();
+  if ((uint32_t)(now - last) < 10000) return;
+  last = now;
+  if (!stable && now > kCrashStableMs) {
+    stable = true;
+    prefs.begin("crash", false);
+    prefs.putUChar("loop", 0);
+    prefs.end();
+  }
+  if (ESP.getFreeHeap() < kLowHeapBytes) {
+    if (++low >= 3) crashRestart(kCrashReasonLowMem, String("free heap ") + ESP.getFreeHeap() + " bytes");
+  } else {
+    low = 0;
+  }
+}
+
 static String describe(uint32_t f) {
   const velux::Frame r = velux::decode(f);
   String s = hex24(f);
@@ -743,6 +911,7 @@ static void handleStatus() {
   j += "\",\"apSsid\":\"";
   j += apActive ? jsonEscape(kApSsid) : String();
   j += "\",\"mode\":\"";
+  if (crashSafeMode)            j += "SAFE MODE after repeated crashes - ";
   if (staConnected && apActive) j += "Wi-Fi (access point closing)";
   else if (staConnected)        j += "connected to Wi-Fi";
   else if (apActive)            j += "Access Point (setup)";
@@ -837,6 +1006,8 @@ static void handleStatus() {
     j += (uint32_t)kBatteryCapacityMah * pct / 100;
     j += '}';
   }
+  j += ",\"positions\":";
+  j += positionsJson();
   j += '}';
   sendJson(j);
 }
@@ -855,14 +1026,19 @@ static uint32_t travelWindowMs(int p) {
 // (or a reversal's STOP) freezes it, and reaching an end stops the estimate
 // there - which also corrects any drift, since after a full run the position
 // is known again. Home Assistant gets the estimate over Zigbee (see
-// handlePositions); at boot the position is unknown (kZigbeeStartLiftPct).
+// handlePositions). The estimate survives a restart (posRestore / posSave):
+// only the very first start has to guess (kZigbeeStartLiftPct), so a reboot
+// does not make Home Assistant see the covers jump back to halfway.
 // Raw frames sent by hand (/api/sendhex) are not tracked.
 struct MotorPos {
   float    pct;    // Zigbee lift percentage: 0 = fully open, 100 = fully closed
   int8_t   dir;    // -1 opening, +1 closing, 0 standing still
   uint32_t since;  // millis() of pct
 };
-static MotorPos motorPos[kPanelCount][3];
+// Slots 0..2 are the motors, slot 3 is the "all" cover. The "all" slot only
+// follows the commands sent to "all": moving one window by itself must not
+// make "all windows" look active in Home Assistant.
+static MotorPos motorPos[kPanelCount][4];
 static portMUX_TYPE posMux = portMUX_INITIALIZER_UNLOCKED;
 
 static float fullTravelMs(int p) {   // the travel time without the safety margin
@@ -880,12 +1056,84 @@ static void posAdvance(int p, int i, uint32_t now) {
   s.since = now;
 }
 
+// The estimate as whole percent, per keypad: [[motor 1, 2, 3, "all"], ...]
+// (0 = open, 100 = closed; Home Assistant is told the same, kept in 1..99).
+static String positionsJson() {
+  uint8_t v[kPanelCount][4];
+  const uint32_t now = millis();
+  portENTER_CRITICAL(&posMux);
+  for (int p = 0; p < kPanelCount; ++p)
+    for (int i = 0; i < 4; ++i) {
+      posAdvance(p, i, now);
+      v[p][i] = (uint8_t)(motorPos[p][i].pct + 0.5f);
+    }
+  portEXIT_CRITICAL(&posMux);
+  String j = "[";
+  for (int p = 0; p < kPanelCount; ++p) {
+    if (p) j += ',';
+    j += '[';
+    for (int i = 0; i < 4; ++i) {
+      if (i) j += ',';
+      j += v[p][i];
+    }
+    j += ']';
+  }
+  j += ']';
+  return j;
+}
+
+// What the estimate was when it was last stored in NVS, one whole percent per
+// slot (0xFF = nothing stored yet).
+static uint8_t posStored[kPanelCount * 4];
+
+// At boot: the stored estimate, if there is one.
+static void posRestore() {
+  memset(posStored, 0xFF, sizeof posStored);
+  uint8_t b[kPanelCount * 4];
+  Preferences nvs;
+  nvs.begin("velux", true);
+  const size_t n = nvs.getBytes("pos", b, sizeof b);
+  nvs.end();
+  if (n != sizeof b) return;
+  for (int p = 0; p < kPanelCount; ++p)
+    for (int i = 0; i < 4; ++i)
+      if (b[p * 4 + i] <= 100) motorPos[p][i] = {(float)b[p * 4 + i], 0, 0};
+  memcpy(posStored, b, sizeof posStored);
+}
+
+// Stores the estimate once every motor stands still and it differs from what
+// is stored: one write per movement, none while a motor runs. Checked once a
+// second.
+static void handlePositionSave() {
+  static uint32_t last = 0;
+  const uint32_t now = millis();
+  if ((uint32_t)(now - last) < 1000) return;
+  last = now;
+  uint8_t cur[kPanelCount * 4];
+  bool moving = false;
+  portENTER_CRITICAL(&posMux);
+  for (int p = 0; p < kPanelCount; ++p)
+    for (int i = 0; i < 4; ++i) {
+      posAdvance(p, i, now);
+      if (motorPos[p][i].dir) moving = true;
+      cur[p * 4 + i] = (uint8_t)(motorPos[p][i].pct + 0.5f);
+    }
+  portEXIT_CRITICAL(&posMux);
+  if (moving || !memcmp(cur, posStored, sizeof cur)) return;
+  Preferences nvs;
+  nvs.begin("velux", false);
+  nvs.putBytes("pos", cur, sizeof cur);
+  nvs.end();
+  memcpy(posStored, cur, sizeof posStored);
+}
+
 // A frame has gone out: the addressed motors start moving (open / close) or
-// stand still (STOP). m = motor 0..2, 3 = all three.
+// stand still (STOP). m = motor 0..2, 3 = all three (which also moves the
+// "all" slot, index 3).
 static void posCommand(int p, int m, int a) {
   const uint32_t now = millis();
   portENTER_CRITICAL(&posMux);
-  for (int i = (m == 3 ? 0 : m); i <= (m == 3 ? 2 : m); ++i) {
+  for (int i = (m == 3 ? 0 : m); i <= m; ++i) {
     posAdvance(p, i, now);
     motorPos[p][i].dir = (a == 0) ? -1 : (a == 2) ? +1 : 0;
   }
@@ -1030,6 +1278,82 @@ static void handleBatteryHistory() {
 static void handleBatteryHistoryClear() {
   prefs.begin("bathist", false);
   prefs.clear();
+  prefs.end();
+  sendJson("{\"ok\":true}");
+}
+
+// The crash log, oldest first:
+// {"safeMode":bool,"total":N,"entries":[{"t","reason","reasonText","task","text","pc","mcause","mtval","ra","bt":[...]}]}
+static void handleCrashLog() {
+  String j = "{\"safeMode\":";
+  j += crashSafeMode ? "true" : "false";
+  prefs.begin("crash", true);
+  j += ",\"total\":";
+  j += prefs.getUInt("count", 0);
+  j += ",\"entries\":[";
+  const uint8_t head = prefs.getUChar("head", 0) % kCrashHistory;
+  bool first = true;
+  for (uint8_t k = 0; k < kCrashHistory; ++k) {
+    char key[4];
+    snprintf(key, sizeof key, "c%u", (unsigned)((head + k) % kCrashHistory));
+    CrashRecord r;
+    if (!prefs.isKey(key) || prefs.getBytes(key, &r, sizeof r) != sizeof r) continue;
+    if (!first) j += ',';
+    first = false;
+    r.task[sizeof r.task - 1] = 0;
+    r.text[sizeof r.text - 1] = 0;
+    j += "{\"t\":";
+    j += r.time;
+    j += ",\"reason\":";
+    j += r.reason;
+    j += ",\"reasonText\":\"";
+    j += jsonEscape(r.reason == kCrashReasonLowMem ? "low memory (restarted on purpose)"
+                                                   : resetReasonName((esp_reset_reason_t)r.reason));
+    j += "\",\"task\":\"";
+    j += jsonEscape(r.task);
+    j += "\",\"text\":\"";
+    j += jsonEscape(r.text);
+    j += "\",\"pc\":";
+    j += r.pc;
+    j += ",\"mcause\":";
+    j += r.mcause;
+    j += ",\"mtval\":";
+    j += r.mtval;
+    j += ",\"ra\":";
+    j += r.ra;
+    j += ",\"bt\":[";
+    for (uint8_t i = 0; i < r.depth && i < 12; ++i) {
+      if (i) j += ',';
+      j += r.bt[i];
+    }
+    j += "]}";
+  }
+  prefs.end();
+  j += "]}";
+  sendJson(j);
+}
+
+// Provokes a fault on purpose, to check what the crash log makes of it:
+// kind=exception (thrown inside the request: logged, answered with a 500, the
+// board carries on),
+// kind=panic (a store to address 0: CPU exception, panic, core dump, restart),
+// kind=terminate (an uncaught exception: its text is kept, then the panic).
+static void handleCrashTest() {
+  const String kind = server.arg("kind");
+  if (kind != "exception" && kind != "panic" && kind != "terminate") {
+    fail("kind must be exception, panic or terminate");
+    return;
+  }
+  if (kind == "exception") throw std::runtime_error("test exception");
+  sendJson("{\"ok\":true}");
+  delay(200);   // let the reply out first
+  if (kind == "terminate") std::terminate();
+  *(volatile int*)0 = 1;
+}
+
+static void handleCrashLogClear() {
+  prefs.begin("crash", false);
+  prefs.clear();   // the history, the counters - and so the safe mode
   prefs.end();
   sendJson("{\"ok\":true}");
 }
@@ -1211,6 +1535,8 @@ static void handleIrTest() {
   sendJson(String("{\"ok\":true,\"irTest\":") + (irTestOn ? "true" : "false") + "}");
 }
 
+static void zbReportUsbLog();   // defined with the Zigbee code below
+
 static void handleUsbLog() {
   const String body = server.arg("plain");
   const int k = body.indexOf("\"enabled\"");
@@ -1221,6 +1547,7 @@ static void handleUsbLog() {
   prefs.begin("velux", false);
   prefs.putUChar("usblog", v.startsWith("true") ? 1 : 0);
   prefs.end();
+  zbReportUsbLog();   // Home Assistant's switch follows
   sendJson("{\"ok\":true}");
 }
 
@@ -1288,27 +1615,51 @@ static void handleFirmwareResult() {
   restartBoard();
 }
 
+// Every route runs inside try/catch. An exception thrown through the WebServer
+// library would leave the connection half-handled and the server deaf to the
+// next request; this way it is logged and answered with a 500 instead.
+static void routeFailed(const char* what, uint32_t startedMs) {
+  pushLog(String("!!  Exception in a web request: ") + what + " (" + (millis() - startedMs) + " ms to unwind)");
+  server.send(500, "application/json", "{\"error\":\"internal error\"}");
+}
+
+static void route(const char* uri, HTTPMethod method, WebServer::THandlerFunction fn) {
+  server.on(uri, method, [fn]() {
+    const uint32_t startedMs = millis();
+    try {
+      fn();
+    } catch (const std::exception& e) {
+      routeFailed(e.what(), startedMs);
+    } catch (...) {
+      routeFailed("unknown exception", startedMs);
+    }
+  });
+}
+
 static void setupHttp() {
-  server.on("/", HTTP_GET, [] {
+  route("/", HTTP_GET, [] {
     server.sendHeader("Content-Encoding", "gzip");
     server.send_P(200, "text/html", (const char*)kIndexHtmlGz, sizeof(kIndexHtmlGz));
   });
-  server.on("/api/status",    HTTP_GET,  handleStatus);
-  server.on("/api/frames",    HTTP_GET,  handleFrames);
-  server.on("/api/battery/history",       HTTP_GET,  handleBatteryHistory);
-  server.on("/api/battery/history/clear", HTTP_POST, handleBatteryHistoryClear);
-  server.on("/api/send",      HTTP_POST, handleSend);
-  server.on("/api/sendhex",   HTTP_POST, handleSendHex);
-  server.on("/api/wifi",      HTTP_POST, handleWifi);
-  server.on("/api/appassword",HTTP_POST, handleApPassword);
-  server.on("/api/usblog",    HTTP_POST, handleUsbLog);
-  server.on("/api/irtest",    HTTP_POST, handleIrTest);
-  server.on("/api/zigbeepair",   HTTP_POST, handleZigbeePair);
-  server.on("/api/zigbeeforget", HTTP_POST, handleZigbeeForget);
-  server.on("/api/wifiscan",  HTTP_GET,  handleWifiScan);
+  route("/api/status",    HTTP_GET,  handleStatus);
+  route("/api/frames",    HTTP_GET,  handleFrames);
+  route("/api/battery/history",       HTTP_GET,  handleBatteryHistory);
+  route("/api/battery/history/clear", HTTP_POST, handleBatteryHistoryClear);
+  route("/api/send",      HTTP_POST, handleSend);
+  route("/api/sendhex",   HTTP_POST, handleSendHex);
+  route("/api/wifi",      HTTP_POST, handleWifi);
+  route("/api/appassword",HTTP_POST, handleApPassword);
+  route("/api/usblog",    HTTP_POST, handleUsbLog);
+  route("/api/irtest",    HTTP_POST, handleIrTest);
+  route("/api/zigbeepair",   HTTP_POST, handleZigbeePair);
+  route("/api/zigbeeforget", HTTP_POST, handleZigbeeForget);
+  route("/api/wifiscan",  HTTP_GET,  handleWifiScan);
   server.on("/api/update",    HTTP_POST, handleFirmwareResult, handleFirmwareUpload);
-  server.on("/api/log/clear", HTTP_POST, [] { logCount = 0; sendJson("{\"ok\":true}"); });
-  server.on("/api/reboot",    HTTP_POST, [] {
+  route("/api/log/clear", HTTP_POST, [] { logCount = 0; sendJson("{\"ok\":true}"); });
+  route("/api/crashlog",       HTTP_GET,  handleCrashLog);
+  route("/api/crashlog/clear", HTTP_POST, handleCrashLogClear);
+  route("/api/crashtest",      HTTP_POST, handleCrashTest);
+  route("/api/reboot",    HTTP_POST, [] {
     sendJson("{\"ok\":true}");
     delay(500);   // give the client a moment to receive the response first
     restartBoard();
@@ -1526,6 +1877,7 @@ static bool readWifiSwitch() {
 // Debounce: acts only if the switch still reads flipped on the next pass of
 // the loop (0.1-1s later).
 static void handleModeSwitch() {
+  if (crashSafeMode) return;   // safe mode forces Wi-Fi on whatever the switch says
   static bool flipped = false;
   if (readWifiSwitch() == wifiEnabled) { flipped = false; return; }
   if (!flipped) { flipped = true; return; }
@@ -1544,15 +1896,17 @@ static const uint8_t kZbMaxCovers = 16;
 static_assert(kZbCovers <= kZbMaxCovers, "too many keypads for the Zigbee cover table");
 
 static ZigbeeWindowCovering* zbCovers[kZbMaxCovers] = {};
+static ZigbeePowerOutlet*    zbUsbLogEp = nullptr;   // the "USB log" switch, see kZigbeeUsbLogEndpoint
 static bool zbStarted = false;
 
 // Commands arrive in the Zigbee stack's own task. Sending one can take over
 // a second (anti-jam STOP + pause) and must not stall the stack, so the
 // callbacks only queue it and loop() sends it.
 struct ZbCommand {
-  uint8_t cover;
+  uint8_t cover;    // or kZbUsbLogCmd: the "USB log" switch, action 1 = on, 0 = off
   uint8_t action;   // 0 open, 1 stop, 2 close
 };
+static const uint8_t kZbUsbLogCmd = 0xFE;
 static QueueHandle_t zbQueue = nullptr;
 
 // Poll rate. A sleepy end device only hears its parent when it asks, so the
@@ -1644,30 +1998,94 @@ static void zbReportCover(int cover, uint8_t v) {
 
 // Sends the estimated positions to the coordinator, at most once per
 // kZigbeePositionReportMs, and only what changed: while a motor runs that is
-// every second, otherwise nothing. The "all" cover shows the three motors'
-// average.
+// every second, otherwise nothing. The "all" cover has a position of its own
+// (it follows only the commands sent to "all").
 static void handlePositions(bool force = false) {
   if (!zbStarted) return;
   static uint32_t last = 0;
   const uint32_t now = millis();
   if (!force && (uint32_t)(now - last) < kZigbeePositionReportMs) return;
   last = now;
-  float pct[kPanelCount][3];
+  float pct[kPanelCount][4];
   portENTER_CRITICAL(&posMux);
   for (int p = 0; p < kPanelCount; ++p)
-    for (int i = 0; i < 3; ++i) {
+    for (int i = 0; i < 4; ++i) {
       posAdvance(p, i, now);
       pct[p][i] = motorPos[p][i].pct;
     }
   portEXIT_CRITICAL(&posMux);
-  for (int p = 0; p < kPanelCount; ++p) {
-    for (int i = 0; i < 3; ++i) zbReportCover(p * 4 + i, zbReportPct(pct[p][i]));
-    zbReportCover(p * 4 + 3, zbReportPct((pct[p][0] + pct[p][1] + pct[p][2]) / 3.0f));
+  for (int p = 0; p < kPanelCount; ++p)
+    for (int i = 0; i < 4; ++i) zbReportCover(p * 4 + i, zbReportPct(pct[p][i]));
+}
+
+// The "USB log" switch of Home Assistant (callback: Zigbee task, so it only
+// queues) and what follows (zb_cmd task): store it and restart to apply it.
+// The web UI's checkbox is the same stored setting, so each side shows what
+// the other did - zbReportUsbLog() tells Home Assistant after a web change.
+static void zbUsbLogChanged(bool on) {
+  zbTouch();
+  const ZbCommand c = {kZbUsbLogCmd, (uint8_t)(on ? 1 : 0)};
+  if (zbQueue) xQueueSend(zbQueue, &c, 0);
+}
+
+// Sets the switch's attribute to the stored setting (quietly: no report).
+static void zbSetUsbLogAttr() {
+  if (zbUsbLogEp && zbStarted) zbUsbLogEp->setState(usbLogSaved());
+}
+
+// Sends the stored setting to Home Assistant: the attribute is set (so a read
+// finds it) and a ZCL "Report Attributes" frame goes straight to the
+// coordinator (0x0000, endpoint 1). It is built by hand and sent as a plain
+// APS packet because the stack has no reporting slot for this attribute:
+// esp_zb_zcl_update_reporting_info() fails with ESP_ERR_NO_MEM, and
+// esp_zb_zcl_report_attr_cmd_req() sends the frame and then aborts
+// (zb_assert) looking for that slot. Needs no binding, so it works without
+// Home Assistant's "reconfigure" too.
+static void zbReportUsbLog() {
+  zbSetUsbLogAttr();
+  if (!zbUsbLogEp || !zbStarted || !Zigbee.connected()) return;
+  static uint8_t seq = 0;
+  static uint8_t zcl[7];
+  zcl[0] = 0x18;            // frame control: general command, server to client, no default response
+  zcl[1] = ++seq;           // transaction sequence number
+  zcl[2] = 0x0A;            // Report Attributes
+  zcl[3] = 0x00; zcl[4] = 0x00;   // attribute 0x0000, OnOff
+  zcl[5] = 0x10;            // data type: boolean
+  zcl[6] = usbLogSaved() ? 1 : 0;
+  esp_zb_apsde_data_req_t req;
+  memset(&req, 0, sizeof(req));
+  req.dst_addr_mode = ESP_ZB_APS_ADDR_MODE_16_ENDP_PRESENT;
+  req.dst_addr.addr_short = 0x0000;
+  req.dst_endpoint = 1;
+  req.profile_id   = ESP_ZB_AF_HA_PROFILE_ID;
+  req.cluster_id   = ESP_ZB_ZCL_CLUSTER_ID_ON_OFF;
+  req.src_endpoint = kZigbeeUsbLogEndpoint;
+  req.asdu_length  = sizeof(zcl);
+  req.asdu         = zcl;
+  req.tx_options   = ESP_ZB_APSDE_TX_OPT_ACK_TX;
+  req.radius       = 8;
+  if (!esp_zb_lock_acquire(pdMS_TO_TICKS(500))) {
+    pushLog("!!  Zigbee: USB log state not sent (stack busy)");
+    return;
   }
+  const esp_err_t err = esp_zb_aps_data_request(&req);
+  esp_zb_lock_release();
+  if (err != ESP_OK) pushLog(String("!!  Zigbee: USB log state not sent, error ") + (int)err);
+}
+
+static void zbApplyUsbLog(bool on) {
+  if (on == usbLogSaved()) return;   // already so: our own report coming back, or the web UI got there first
+  prefs.begin("velux", false);
+  prefs.putUChar("usblog", on ? 1 : 0);
+  prefs.end();
+  pushLog(String("ZB  Zigbee  USB log: ") + (on ? "on" : "off") + " - restarting to apply it");
+  delay(1500);   // the stack's reply to Home Assistant goes out first
+  restartBoard();
 }
 
 static void runZigbeeCommand(const ZbCommand& c) {
   static const char* const kNames[3] = {"open", "stop", "close"};
+  if (c.cover == kZbUsbLogCmd) { zbApplyUsbLog(c.action != 0); return; }
   const int p = c.cover / 4, m = c.cover % 4;
   pushLog(String("ZB  Zigbee  ") + zbCoverName(c.cover) + ": " + kNames[c.action]);
   const char* err = runCommand(p, m, c.action, nullptr);
@@ -1686,7 +2104,14 @@ static void runZigbeeCommand(const ZbCommand& c) {
 static void zbCmdTask(void*) {
   for (;;) {
     ZbCommand c;
-    if (xQueueReceive(zbQueue, &c, portMAX_DELAY) == pdTRUE) runZigbeeCommand(c);
+    if (xQueueReceive(zbQueue, &c, portMAX_DELAY) != pdTRUE) continue;
+    try {
+      runZigbeeCommand(c);
+    } catch (const std::exception& e) {   // logged; the next command goes on as usual
+      pushLog(String("!!  Exception in a Zigbee command: ") + e.what());
+    } catch (...) {
+      pushLog("!!  Unknown exception in a Zigbee command");
+    }
   }
 }
 
@@ -1746,6 +2171,11 @@ static void setupZigbee(bool erase) {
     Zigbee.addEndpoint(cv);
     Serial.printf("Zigbee endpoint %u: %s\n", kZigbeeFirstEndpoint + i, zbCoverName(i).c_str());
   }
+  zbUsbLogEp = new ZigbeePowerOutlet(kZigbeeUsbLogEndpoint);
+  zbUsbLogEp->setManufacturerAndModel(kZigbeeManufacturer, kZigbeeModel);
+  zbUsbLogEp->onPowerOutletChange(zbUsbLogChanged);
+  Zigbee.addEndpoint(zbUsbLogEp);
+  Serial.printf("Zigbee endpoint %u: USB log switch\n", kZigbeeUsbLogEndpoint);
   if (batteryMv > 0)
     zbCovers[0]->setPowerSource(ZB_POWER_SOURCE_BATTERY, batteryPercent(batteryMv), (uint8_t)(batteryMv / 100));
 
@@ -1780,6 +2210,7 @@ static void setupZigbee(bool erase) {
   if (zbStarted) {
     for (uint8_t i = 0; i < kZbMaxCovers; ++i) zbReported[i] = 0xFF;
     handlePositions(true);
+    zbSetUsbLogAttr();
   }
   Serial.printf("Zigbee: %s\n", !zbStarted           ? "FAILED to start"
                                : Zigbee.connected() ? "started, joined"
@@ -1809,16 +2240,29 @@ static void zbStartTurboPoll() {
 static void handleZigbeePoll() {
   if (!zbStarted) return;
   static bool wasConnected = false;
-  static uint32_t lastApply = 0, turboFor = 0;
+  static uint32_t lastApply = 0, turboFor = 0, joinedAt = 0;
+  static uint8_t usbLogReports = 2;             // still to send after a join
   const bool connected = Zigbee.connected();
   const uint32_t now = millis();
   if (connected && !wasConnected) {
     zbTouch();                                  // just joined: Home Assistant is about to talk
     if (!zbPairedFlag()) setZbPaired(true);     // from now on the stack starts at boot
     lastApply = 0;
+    joinedAt = now ? now : 1;
+    usbLogReports = 0;
   }
   wasConnected = connected;
   if (!connected) return;
+  // After every (re)join the "USB log" switch tells Home Assistant where it
+  // stands: Home Assistant doesn't poll a sleepy node, so after a restart it
+  // would keep showing whatever it last knew. Once the join has settled
+  // (10 s), and again later (45 s) in case the first report was lost. Not
+  // after a crash: if this report were what crashed, it must not do it again
+  // at every boot until the safe mode switches Zigbee off.
+  if (usbLogReports < 2 && !crashInARow && (uint32_t)(now - joinedAt) >= (usbLogReports ? 45000u : 10000u)) {
+    ++usbLogReports;
+    zbReportUsbLog();
+  }
   // The join procedure finishes after the "joined" signal: apply the poll
   // interval right away, again a few seconds later, then every 30 s.
   if (!lastApply || (uint32_t)(now - lastApply) >= (zbPollMs == kZigbeePollMs && lastApply ? 30000u : 3000u)) {
@@ -1883,6 +2327,7 @@ static void handleZigbeeReset() {
 }
 
 static const char* zigbeeStatus() {
+  if (crashSafeMode) return "off (safe mode)";
   if (zbStarted) return Zigbee.connected() ? "joined" : "pairing: looking for a network";
   if (zbStartRequested) return "starting";
   return zbPairedFlag() ? "failed to start" : "not paired (press Start pairing in the web UI)";
@@ -1908,14 +2353,14 @@ static bool ledIdentifying() {
 }
 
 static uint32_t ledPeriodMs() {   // 0 = steady on
-  if (ledIdentifying()) return kLedIdentifyPeriodMs;
+  if (ledIdentifying() || crashSafeMode) return kLedIdentifyPeriodMs;   // safe mode: pulsing like Identify, for good
   if (!statusLedBooted) return 0;
   if (zigbeePairing()) return kLedPairingPeriodMs;
   return kLedIdlePeriodMs;
 }
 
 static uint32_t ledFlashMs() {
-  return ledIdentifying() ? kLedIdentifyFlashMs : kLedFlashMs;
+  return (ledIdentifying() || crashSafeMode) ? kLedIdentifyFlashMs : kLedFlashMs;
 }
 
 static void handleStatusLed() {
@@ -1965,8 +2410,9 @@ static void handleSerialDebug() {
 }
 
 void setup() {
-  for (uint8_t p = 0; p < kPanelCount; ++p)       // position unknown until a full run
-    for (uint8_t i = 0; i < 3; ++i) motorPos[p][i] = {(float)kZigbeeStartLiftPct, 0, 0};
+  for (uint8_t p = 0; p < kPanelCount; ++p)       // position unknown until a full run...
+    for (uint8_t i = 0; i < 4; ++i) motorPos[p][i] = {(float)kZigbeeStartLiftPct, 0, 0};
+  posRestore();                                   // ...unless a restart left one behind
   cmdLock  = xSemaphoreCreateRecursiveMutex();
   logLock  = xSemaphoreCreateMutex();
   loopTask = xTaskGetCurrentTaskHandle();
@@ -1989,6 +2435,11 @@ void setup() {
   prefs.end();
   if (usbLog) {
     Serial.begin(115200);
+    // With the cable plugged in but no terminal open, a full USB buffer would
+    // otherwise block every print for up to 2 s (20 x 100 ms) and stall the
+    // loop; a log line is not worth that. 2 ms still lets an open terminal
+    // drain the buffer, and caps the stall at about 40 ms when none is.
+    Serial.setTxTimeoutMs(2);
     // give the serial monitor time to (re)open the port
     for (const uint32_t t0 = millis(); !Serial && millis() - t0 < kUsbLogWaitMs;) delay(10);
     delay(200);
@@ -1999,6 +2450,9 @@ void setup() {
   }
   Serial.printf("\nVELUX WLI 130 51 - IR bridge  [v %s]\n", kVersion);
   Serial.printf("Reset reason: %s\n", resetReasonName(esp_reset_reason()));
+  std::set_terminate(crashTerminate);   // an uncaught C++ exception leaves its text
+  crashInit();                          // records a crash, decides about safe mode
+  if (crashSafeMode) wifiEnabled = true;   // Wi-Fi on, whatever the switch says
   for (uint8_t i = 0; i < kPanelCount; ++i)
     for (uint8_t j = 0; j < 4; ++j) lastDirAction[i][j] = -1;
 
@@ -2049,8 +2503,9 @@ void setup() {
 
   // The Zigbee stack starts here only on a board that has been paired; on a
   // new one it waits for "Start pairing" in the web UI (Wi-Fi mode).
-  if (zbPairedFlag()) setupZigbee(false);
-  else                Serial.println("Zigbee: not paired - use Start pairing in the web UI (Wi-Fi switch ON)");
+  if (crashSafeMode)       Serial.println("Zigbee: off - safe mode");
+  else if (zbPairedFlag()) setupZigbee(false);
+  else                     Serial.println("Zigbee: not paired - use Start pairing in the web UI (Wi-Fi switch ON)");
 
   // Boot is over: the clock policy of the mode. With power management the
   // clock now floats (Zigbee only) or stays at the maximum (Wi-Fi); without
@@ -2086,7 +2541,9 @@ static void waitForWork(uint32_t waitMs) {
   select(maxFd + 1, &rd, nullptr, nullptr, &tv);
 }
 
-void loop() {
+// One pass of the main loop. loop() wraps it: an exception thrown by anything
+// in here is logged and the loop carries on, instead of ending in a panic.
+static void loopOnce() {
   if (wifiEnabled) {
     server.handleClient();
     ArduinoOTA.handle();
@@ -2101,8 +2558,10 @@ void loop() {
   handleZigbeeBattery();
   handleZigbeePoll();
   handlePositions();
+  handlePositionSave();
   handleStatusLed();
   handleSerialDebug();
+  handleHealth();
   if (pmUpdateHold) return;
 
   // Where the loop sleeps until there is something to do.
@@ -2112,5 +2571,17 @@ void loop() {
     // Zigbee only: sleep until the LED needs attention (or Identify wakes us)
     const uint32_t wait = ledWaitMs();
     ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(wait < kLoopMaxWaitMs ? wait : kLoopMaxWaitMs));
+  }
+}
+
+void loop() {
+  try {
+    loopOnce();
+  } catch (const std::exception& e) {
+    pushLog(String("!!  Exception caught: ") + e.what());
+    delay(100);   // don't spin if it recurs
+  } catch (...) {
+    pushLog("!!  Unknown exception caught");
+    delay(100);
   }
 }

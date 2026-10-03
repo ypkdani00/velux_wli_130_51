@@ -27,6 +27,7 @@ kZigbeeFirstEndpoint + keypad * 4 + motor, motor 3 = all three.
 
 from zigpy.quirks.v2 import QuirkBuilder
 from zigpy.zcl.clusters.closures import WindowCovering
+from zigpy.zcl.clusters.general import OnOff
 
 MANUFACTURER = "VELUX"                # kZigbeeManufacturer
 MODEL = "WLI 130 IR"                  # kZigbeeModel
@@ -42,6 +43,8 @@ COVERS = {
     17: "All blinds",
 }
 
+USB_LOG_ENDPOINT = 30                 # kZigbeeUsbLogEndpoint: On/Off switch
+
 builder = QuirkBuilder(MANUFACTURER, MODEL)
 for endpoint_id, name in COVERS.items():
     builder = builder.change_entity_metadata(
@@ -49,4 +52,9 @@ for endpoint_id, name in COVERS.items():
         cluster_id=WindowCovering.cluster_id,
         new_fallback_name=name,
     )
+builder = builder.change_entity_metadata(
+    endpoint_id=USB_LOG_ENDPOINT,
+    cluster_id=OnOff.cluster_id,
+    new_fallback_name="USB log",
+)
 builder.add_to_registry()

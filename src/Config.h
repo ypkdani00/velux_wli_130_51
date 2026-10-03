@@ -89,7 +89,7 @@ static const char* kTimezone = "CET-1CEST,M3.5.0,M10.5.0/3";
 
 // How many commands the frame log (Log tab) keeps: the last ones, in RAM -
 // lost at a restart. About 150 bytes per entry; the status page grows with it.
-static const uint8_t kLogEntries = 16;
+static const uint8_t kLogEntries = 32;
 
 
 // Wi-Fi radio transmit power. Lowering it reduces the radio's peak current
@@ -333,6 +333,11 @@ static const uint16_t kBatteryCapacityMah = 2500;    // only for the "mAh left" 
 // is how often it asks, i.e. the longest a Zigbee command waits. Each poll
 // costs a few ms of radio: 1000 = commands within ~1s, a fraction of a mA.
 static const uint8_t  kZigbeeFirstEndpoint = 10;
+// One more endpoint, an On/Off switch "USB log": the same setting as the web
+// UI's USB log card, kept in step both ways. Switching it from Home Assistant
+// stores it and restarts the board to apply it (the console and light sleep
+// are set up at boot), so the console can be turned on without Wi-Fi.
+static const uint8_t  kZigbeeUsbLogEndpoint = 30;
 // Home Assistant shows manufacturer + model: "VELUX WLI 130 IR". Changing
 // them needs a new pairing (ZHA reads them once, when the device joins).
 static const char*    kZigbeeManufacturer  = "VELUX";
@@ -345,8 +350,10 @@ static const bool     kZigbeeSleepy        = true;
 // the position is ESTIMATED from the travel time (kTravelTime*Ms, section 4):
 // an actuator moves at a constant speed, an open / close starts it, a STOP
 // freezes it, an end of travel stops the estimate there. It is sent every
-// kZigbeePositionReportMs while a motor runs. At boot the position is unknown
-// (kZigbeeStartLiftPct, halfway) until the first full run corrects it.
+// kZigbeePositionReportMs while a motor runs. It is stored when the motors
+// stop and restored after a restart, so a reboot changes nothing in Home
+// Assistant; only the very first start is a guess (kZigbeeStartLiftPct,
+// halfway) until the first full run corrects it.
 // The reported value is kept between kZigbeePosMinPct and kZigbeePosMaxPct,
 // never exactly 0 or 100: at the ends HA greys out the open (close) button,
 // and opening or closing again must always be possible.
@@ -377,6 +384,20 @@ static const uint32_t kZigbeeBatteryReportMs = 60UL * 60 * 1000;   // battery % 
 // system timer (22) stay above them.
 static const uint8_t  kZigbeeTaskPriority = 20;
 static const uint8_t  kCmdTaskPriority    = 21;
+
+// ----- 8) RELIABILITY -------------------------------------------------------
+// A restart after a crash (CPU exception, watchdog, brownout, stack overflow)
+// is recorded - task, program counter, backtrace, reason - and shown in the
+// Log tab ("Crash log"); see the README, "Crashes".
+//   kLowHeapBytes   : free heap below this for 30 s restarts the board (and
+//                     records it) before it runs out of memory altogether.
+//   kCrashLoopLimit : this many crashes in a row start SAFE MODE - Wi-Fi on,
+//                     Zigbee off - so the log can be read and the firmware
+//                     replaced. Clearing the crash log ends it.
+//   kCrashStableMs  : a run this long without a crash ends the "in a row" count.
+static const uint32_t kLowHeapBytes   = 30000;
+static const uint8_t  kCrashLoopLimit = 3;
+static const uint32_t kCrashStableMs  = 10UL * 60 * 1000;
 
 // ===========================================================================
 //  END USER CONFIGURATION
