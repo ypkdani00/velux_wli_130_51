@@ -153,7 +153,6 @@ static uint32_t lastStopTime[kPanelCount][4];    // millis() | 1 of the last STO
 static const char* resetReasonName(esp_reset_reason_t r);
 static const char* zigbeeStatus();
 static bool usbLogSaved();
-static String positionsJson();   // see "position estimate"
 static bool zbPairedFlag();     // the network was joined once (stored in NVS)
 static bool zigbeePairing();    // stack running, not (yet) on a network
 static bool zbRequestPair();    // web UI: start the stack / the search for a network
@@ -1064,8 +1063,6 @@ static void handleStatus() {
     j += (uint32_t)kBatteryCapacityMah * pct / 100;
     j += '}';
   }
-  j += ",\"positions\":";
-  j += positionsJson();
   j += '}';
   sendJson(j);
 }
@@ -1074,128 +1071,6 @@ static void handleStatus() {
 // travelling: the full travel time of that kind of motor plus a margin.
 static uint32_t travelWindowMs(int p) {
   return (kPanels[p].kind == kCoverBlind ? kTravelTimeBlindMs : kTravelTimeWindowMs) + kTravelMarginMs;
-}
-
-// ------------------------------ position estimate ---------------------------
-//
-// The IR protocol never reports back, so the position is worked out from the
-// travel time: an actuator moves at a constant speed, so in
-// kTravelTime*Ms it covers 100%. An open or close starts it moving, a STOP
-// (or a reversal's STOP) freezes it, and reaching an end stops the estimate
-// there - which also corrects any drift, since after a full run the position
-// is known again. Home Assistant gets the estimate over Zigbee (see
-// handlePositions). The estimate survives a restart (posRestore / posSave):
-// only the very first start has to guess (kZigbeeStartLiftPct), so a reboot
-// does not make Home Assistant see the covers jump back to halfway.
-// Raw frames sent by hand (/api/sendhex) are not tracked.
-struct MotorPos {
-  float    pct;    // Zigbee lift percentage: 0 = fully open, 100 = fully closed
-  int8_t   dir;    // -1 opening, +1 closing, 0 standing still
-  uint32_t since;  // millis() of pct
-};
-// Slots 0..2 are the motors, slot 3 is the "all" cover. The "all" slot only
-// follows the commands sent to "all": moving one window by itself must not
-// make "all windows" look active in Home Assistant.
-static MotorPos motorPos[kPanelCount][4];
-static portMUX_TYPE posMux = portMUX_INITIALIZER_UNLOCKED;
-
-static float fullTravelMs(int p) {   // the travel time without the safety margin
-  return (float)(kPanels[p].kind == kCoverBlind ? kTravelTimeBlindMs : kTravelTimeWindowMs);
-}
-
-// Brings the estimate of one motor up to now. Call with posMux held.
-static void posAdvance(int p, int i, uint32_t now) {
-  MotorPos& s = motorPos[p][i];
-  if (s.dir) {
-    s.pct += s.dir * (float)(uint32_t)(now - s.since) * 100.0f / fullTravelMs(p);
-    if (s.pct <= 0)   { s.pct = 0;   s.dir = 0; }
-    if (s.pct >= 100) { s.pct = 100; s.dir = 0; }
-  }
-  s.since = now;
-}
-
-// The estimate as whole percent, per keypad: [[motor 1, 2, 3, "all"], ...]
-// (0 = open, 100 = closed; Home Assistant is told the same, kept in 1..99).
-static String positionsJson() {
-  uint8_t v[kPanelCount][4];
-  const uint32_t now = millis();
-  portENTER_CRITICAL(&posMux);
-  for (int p = 0; p < kPanelCount; ++p)
-    for (int i = 0; i < 4; ++i) {
-      posAdvance(p, i, now);
-      v[p][i] = (uint8_t)(motorPos[p][i].pct + 0.5f);
-    }
-  portEXIT_CRITICAL(&posMux);
-  String j = "[";
-  for (int p = 0; p < kPanelCount; ++p) {
-    if (p) j += ',';
-    j += '[';
-    for (int i = 0; i < 4; ++i) {
-      if (i) j += ',';
-      j += v[p][i];
-    }
-    j += ']';
-  }
-  j += ']';
-  return j;
-}
-
-// What the estimate was when it was last stored in NVS, one whole percent per
-// slot (0xFF = nothing stored yet).
-static uint8_t posStored[kPanelCount * 4];
-
-// At boot: the stored estimate, if there is one.
-static void posRestore() {
-  memset(posStored, 0xFF, sizeof posStored);
-  uint8_t b[kPanelCount * 4];
-  Preferences nvs;
-  nvs.begin("velux", true);
-  const size_t n = nvs.getBytes("pos", b, sizeof b);
-  nvs.end();
-  if (n != sizeof b) return;
-  for (int p = 0; p < kPanelCount; ++p)
-    for (int i = 0; i < 4; ++i)
-      if (b[p * 4 + i] <= 100) motorPos[p][i] = {(float)b[p * 4 + i], 0, 0};
-  memcpy(posStored, b, sizeof posStored);
-}
-
-// Stores the estimate once every motor stands still and it differs from what
-// is stored: one write per movement, none while a motor runs. Checked once a
-// second.
-static void handlePositionSave() {
-  static uint32_t last = 0;
-  const uint32_t now = millis();
-  if ((uint32_t)(now - last) < 1000) return;
-  last = now;
-  uint8_t cur[kPanelCount * 4];
-  bool moving = false;
-  portENTER_CRITICAL(&posMux);
-  for (int p = 0; p < kPanelCount; ++p)
-    for (int i = 0; i < 4; ++i) {
-      posAdvance(p, i, now);
-      if (motorPos[p][i].dir) moving = true;
-      cur[p * 4 + i] = (uint8_t)(motorPos[p][i].pct + 0.5f);
-    }
-  portEXIT_CRITICAL(&posMux);
-  if (moving || !memcmp(cur, posStored, sizeof cur)) return;
-  Preferences nvs;
-  nvs.begin("velux", false);
-  nvs.putBytes("pos", cur, sizeof cur);
-  nvs.end();
-  memcpy(posStored, cur, sizeof posStored);
-}
-
-// A frame has gone out: the addressed motors start moving (open / close) or
-// stand still (STOP). m = motor 0..2, 3 = all three (which also moves the
-// "all" slot, index 3).
-static void posCommand(int p, int m, int a) {
-  const uint32_t now = millis();
-  portENTER_CRITICAL(&posMux);
-  for (int i = (m == 3 ? 0 : m); i <= m; ++i) {
-    posAdvance(p, i, now);
-    motorPos[p][i].dir = (a == 0) ? -1 : (a == 2) ? +1 : 0;
-  }
-  portEXIT_CRITICAL(&posMux);
 }
 
 // Remembers when a STOP frame for motor m (3 = all three) went out, see the
@@ -1261,7 +1136,6 @@ static const char* runCommand(int p, int m, int a, bool* autoStop) {
       // Actuator is actively travelling in reverse: send STOP first to prevent WLC 100 fault/lockout
       sendFrame(velux::build(velux::ACT_STOP, kMotors[m], panelCode[p]));
       stampStop(p, m);
-      posCommand(p, m, 1);   // the motor stands still during the pause
       autoStopSent = true;
       // Pause for the motor to settle - cut short, and the new direction
       // dropped, if a STOP for it arrives meanwhile.
@@ -1302,7 +1176,6 @@ static const char* runCommand(int p, int m, int a, bool* autoStop) {
 
   sendFrame(velux::build(kActions[a], kMotors[m], panelCode[p]));
   if (a == 1) stampStop(p, m);
-  posCommand(p, m, a);   // position estimate: the motors now move / stand still
   if (a == 1 && stopPendingCover == p * 4 + m) stopPendingCover = -1;   // the STOP has gone out
   if (autoStop) *autoStop = autoStopSent;
   return nullptr;
@@ -2088,47 +1961,6 @@ static String zbCoverName(uint8_t cover) {
   return String(m == 3 ? kPanels[p].all : kPanels[p].motor[m]);
 }
 
-// What Home Assistant was last told for each cover, so only changes are sent.
-static uint8_t zbReported[kZbMaxCovers];
-
-// The estimated position (see "position estimate") to report: whole
-// percent, never exactly 0 or 100 - at the ends HA greys out the open (close)
-// button, and opening or closing again must always be possible.
-static uint8_t zbReportPct(float v) {
-  int r = (int)(v + 0.5f);
-  if (r < kZigbeePosMinPct) r = kZigbeePosMinPct;
-  if (r > kZigbeePosMaxPct) r = kZigbeePosMaxPct;
-  return (uint8_t)r;
-}
-
-static void zbReportCover(int cover, uint8_t v) {
-  if (!zbCovers[cover] || zbReported[cover] == v) return;
-  zbCovers[cover]->setLiftPercentage(v);
-  zbReported[cover] = v;
-}
-
-// Sends the estimated positions to the coordinator, at most once per
-// kZigbeePositionReportMs, and only what changed: while a motor runs that is
-// every second, otherwise nothing. The "all" cover has a position of its own
-// (it follows only the commands sent to "all").
-static void handlePositions(bool force = false) {
-  if (!zbStarted) return;
-  static uint32_t last = 0;
-  const uint32_t now = millis();
-  if (!force && (uint32_t)(now - last) < kZigbeePositionReportMs) return;
-  last = now;
-  float pct[kPanelCount][4];
-  portENTER_CRITICAL(&posMux);
-  for (int p = 0; p < kPanelCount; ++p)
-    for (int i = 0; i < 4; ++i) {
-      posAdvance(p, i, now);
-      pct[p][i] = motorPos[p][i].pct;
-    }
-  portEXIT_CRITICAL(&posMux);
-  for (int p = 0; p < kPanelCount; ++p)
-    for (int i = 0; i < 4; ++i) zbReportCover(p * 4 + i, zbReportPct(pct[p][i]));
-}
-
 // The "USB log" switch of Home Assistant (callback: Zigbee task, so it only
 // queues) and what follows (zb_cmd task): store it and restart to apply it.
 // The web UI's checkbox is the same stored setting, so each side shows what
@@ -2316,13 +2148,10 @@ static void setupZigbee(bool erase) {
     esp_zb_set_rx_on_when_idle(false);
     esp_zb_lock_release();
   }
-  // Tell the network where the covers are right away (the estimate; halfway
-  // at boot, since the position is unknown until a full run).
-  if (zbStarted) {
-    for (uint8_t i = 0; i < kZbMaxCovers; ++i) zbReported[i] = 0xFF;
-    handlePositions(true);
-    zbSetUsbLogAttr();
-  }
+  // The covers report no position at all (the IR protocol never says where a
+  // window is): the attribute stays at its "unknown" default, which leaves
+  // both the open and the close button of Home Assistant enabled.
+  if (zbStarted) zbSetUsbLogAttr();
   Serial.printf("Zigbee: %s\n", !zbStarted           ? "FAILED to start"
                                : Zigbee.connected() ? "started, joined"
                                                     : "started, looking for a network");
@@ -2533,12 +2362,15 @@ static void handleSerialDebug() {
 }
 
 void setup() {
-  for (uint8_t p = 0; p < kPanelCount; ++p)       // position unknown until a full run...
-    for (uint8_t i = 0; i < 4; ++i) motorPos[p][i] = {(float)kZigbeeStartLiftPct, 0, 0};
-  posRestore();                                   // ...unless a restart left one behind
   cmdLock  = xSemaphoreCreateRecursiveMutex();
   logLock  = xSemaphoreCreateMutex();
   rtcLogInit();                                   // keeps the run before this one, starts a new log
+  {                                               // left by versions that stored a position estimate
+    Preferences nvs;
+    nvs.begin("velux", false);
+    nvs.remove("pos");
+    nvs.end();
+  }
   loopTask = xTaskGetCurrentTaskHandle();
 
   // Boot runs at full speed (kCpuFreqBootMhz): Wi-Fi, Zigbee and the web
@@ -2687,8 +2519,6 @@ static void loopOnce() {
   handleZigbeeBattery();
   handleZigbeePoll();
   handleHeartbeat();
-  handlePositions();
-  handlePositionSave();
   handleStatusLed();
   handleSerialDebug();
   handleHealth();

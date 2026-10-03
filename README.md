@@ -45,8 +45,8 @@ This firmware re-implements the WLR 100's IR protocol, so the board can:
 - **Transmit** open / stop / close commands to any number of WLI 130 keypads
   (each keypad only reacts to its own 10-bit security code).
 - Show up in Home Assistant over **Zigbee** as window coverings, one per
-  motor plus an "all" cover per keypad, with a **position estimated** from the
-  travel time, a battery level and an Identify button.
+  motor plus an "all" cover per keypad (open / close / stop, no position: the
+  IR protocol never reports it), a battery level and an Identify button.
 - Run on a **battery** for months: Zigbee as a sleepy end device, light sleep
   between radio wake-ups, Wi-Fi off unless you switch it on.
 - With the Wi-Fi switch ON, serve a mobile-friendly **web UI** (controls, log,
@@ -211,12 +211,12 @@ for "all three" (endpoint = `kZigbeeFirstEndpoint` + keypad × 4 + motor):
   The two are one stored setting and follow each other: change it in the web
   UI and the switch in Home Assistant follows; change the switch and the
   setting is stored and **the board restarts** to apply it (the console and
-  light sleep are set up at boot; the position estimate is lost with the
-  restart). The board does not push its state to Home Assistant after a
-  restart (an explicit report of the On/Off attribute aborts inside the
-  stack), so if the switch shows the wrong state, press the other position
-  first, then the one you want. Adding this endpoint to an already paired
-  board needs a
+  light sleep are set up at boot). After every join (10 s and 45 s later) and
+  after a change from the web UI, the board sends its state to the
+  coordinator as a ZCL "Report Attributes" frame it builds itself and sends
+  as a plain APS packet: the stack has no reporting slot for this attribute,
+  and its own report call aborts. So Home Assistant follows without a
+  "Reconfigure". Adding this endpoint to an already paired board needs a
   **Reconfigure** of the device in ZHA (or a new pairing) before the switch
   shows up.
 - **Pairing** is started from the web UI (**Settings → Zigbee → Start
@@ -226,20 +226,16 @@ for "all three" (endpoint = `kZigbeeFirstEndpoint` + keypad × 4 + motor):
   and their entity IDs.
 - **Open / close / stop** send the matching IR frame. **Set position**: below
   50% opens, 50% and above closes — the IR protocol only knows "all the way".
-- **Position estimate.** The IR protocol never reports back, so the board
-  **estimates** the position from the travel time (`kTravelTimeWindowMs` =
-  23 s, `kTravelTimeBlindMs` = 25 s): an actuator moves at constant speed, an
-  open / close starts the estimate, a STOP freezes it, the end of travel
-  stops it there. Home Assistant gets it **every second while a motor runs**;
-  "All windows / All blinds" have a position of their own and follow only the
-  commands sent to them: moving one window by itself leaves "All windows"
-  alone, while an "all" command moves the three windows too. The estimate is
-  stored when the motors stop and restored after a restart (a reboot changes
-  nothing in Home Assistant); only the very first start is a guess (50%), and
-  after one full run it is right again. Every full run corrects any drift. The reported value stays between 1% and 99%, never exactly 0% or
-  100%: Home Assistant greys out the open (close) button of a cover it
-  believes fully open (closed), and opening or closing again must always be
-  possible.
+- **No position.** The IR protocol never reports back, so the board does not
+  know where a window or blind is, and an estimate from the travel time turned
+  out not to be workable. The covers report no position at all: the lift
+  attribute stays at its "unknown" default, and Home Assistant shows an
+  unknown state with **both the open and the close button enabled** (a made-up
+  value would grey one of them out at the ends). The travel times
+  (`kTravelTimeWindowMs`, `kTravelTimeBlindMs`) are still used by the anti-jam
+  protection. After updating from a version that reported a position, a
+  restart of Home Assistant (or **Reconfigure** of the device) makes it drop
+  the last percentage it had.
 - **Types.** Windows are announced as *roller shades* and blinds as *exterior
   roller shades* (Zigbee has no window type; its "shutter" is tilt-only and
   ZHA would drop the up/down controls). For a window icon set the entity's
@@ -364,7 +360,7 @@ Everything you are likely to change lives in one file, in numbered sections:
 4. **Travel times and anti-jam** — `kTravelTimeWindowMs` (23 s),
    `kTravelTimeBlindMs` (25 s), `kTravelMarginMs`, `kAutoStopPauseMs`.
    **Measure your actuators with a stopwatch and enter the real values**: they
-   drive both the anti-jam protection and the position estimate.
+   drive the anti-jam protection.
 5. **Power saving** — the CPU clock (`kCpuFreqBootMhz` 160, `kCpuFreqWifiMhz`
    160, `kCpuFreqMhz` 80, `kCpuFreqIdleMinMhz` 80; boot always runs at full
    speed, then Wi-Fi mode stays at the maximum and Zigbee-only floats between
@@ -374,7 +370,7 @@ Everything you are likely to change lives in one file, in numbered sections:
 6. **Battery** — pin, divider, calibration (measure the cell with a
    multimeter and set `kBatteryCalibration` to *real ÷ shown*), capacity.
 7. **Zigbee** — first endpoint, manufacturer ("VELUX") and model ("WLI 130
-   IR"), sleepy or not, position-report limits, poll interval, battery report
+   IR"), sleepy or not, poll interval, battery report
    interval, and the **task priorities** (`kCmdTaskPriority` 21,
    `kZigbeeTaskPriority` 20).
 8. **Reliability** — `kLowHeapBytes`, `kCrashLoopLimit`, `kCrashStableMs`
@@ -529,7 +525,7 @@ panics in a row start the safe mode.
 
 - `src/Config.h` — **start here**: every setting you are likely to change
 - `src/main.cpp` — the firmware: Zigbee, Wi-Fi, web server, OTA, IR
-  transmission, anti-jam, position estimate, power management, battery
+  transmission, anti-jam, power management, battery
 - `src/VeluxIR.h` — the protocol: frame layout, checksum, encode / decode
 - `src/WebUI.h` — the web page (single file, no external resources); after
   editing it run `node tools/build_webui_gz.js` (the build does it for you)

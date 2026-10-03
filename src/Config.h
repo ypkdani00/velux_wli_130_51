@@ -317,7 +317,7 @@ static const uint16_t kBatteryCapacityMah = 2500;    // only for the "mAh left" 
 //
 // Open / close / stop (and "set position": below 50% = open, otherwise
 // close) send the same IR frames as the web UI, anti-jam logic included.
-// Positions are optimistic - the VELUX IR protocol never reports back.
+// No position is reported - the VELUX IR protocol never reports back.
 //
 // Names and icons in Home Assistant: Zigbee has no per-endpoint name, so ZHA
 // calls every cover "Cover", "Cover 2"... The ZHA quirk in zha/ renames them
@@ -349,22 +349,10 @@ static const char*    kZigbeeModel         = "WLI 130 IR";
 // Sleepy end device: the radio is off between polls (battery operation).
 // false = radio always on, commands instant, ~20 mA more: only to test.
 static const bool     kZigbeeSleepy        = true;
-// Position reported to Home Assistant (Zigbee lift percentage: 0 = open,
-// 100 = closed; HA shows 100 - it). The IR protocol never reports back, so
-// the position is ESTIMATED from the travel time (kTravelTime*Ms, section 4):
-// an actuator moves at a constant speed, an open / close starts it, a STOP
-// freezes it, an end of travel stops the estimate there. It is sent every
-// kZigbeePositionReportMs while a motor runs. It is stored when the motors
-// stop and restored after a restart, so a reboot changes nothing in Home
-// Assistant; only the very first start is a guess (kZigbeeStartLiftPct,
-// halfway) until the first full run corrects it.
-// The reported value is kept between kZigbeePosMinPct and kZigbeePosMaxPct,
-// never exactly 0 or 100: at the ends HA greys out the open (close) button,
-// and opening or closing again must always be possible.
-static const uint8_t  kZigbeeStartLiftPct   = 50;
-static const uint8_t  kZigbeePosMinPct      = 1;
-static const uint8_t  kZigbeePosMaxPct      = 99;
-static const uint32_t kZigbeePositionReportMs = 1000;
+// The covers report no position: the IR protocol never says where a window
+// is, and an estimate from the travel time turned out not to be workable. The
+// lift attribute stays at its "unknown" default, so Home Assistant shows an
+// unknown state with both the open and the close button enabled.
 // How often the board asks its parent for waiting commands: the longest a
 // Zigbee command waits, and the main battery cost (a few ms of radio each
 // time). The stack's own default is ~5 s - the delay before this was set.
