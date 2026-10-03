@@ -1,0 +1,11 @@
+{
+  // Parallel compile jobs for every build started from VS Code: PlatformIO's
+  // own Build button, the tasks in tasks.json, and the second "pio run" the
+  // hybrid (light sleep) build starts by itself. 8 = every logical CPU of
+  // this PC (4 cores x 2 threads); the compile already keeps them all at
+  // 100%, so a higher number doesn't build any faster. Lower it to keep the
+  // PC responsive during a build. Takes effect in new terminals/tasks.
+  "terminal.integrated.env.windows": {
+    "PLATFORMIO_RUN_JOBS": "8"
+  }
+}

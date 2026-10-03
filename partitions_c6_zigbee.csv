@@ -1,0 +1,13 @@
+# FireBeetle 2 ESP32-C6 (4MB), PlatformIO env firebeetle2_c6.
+# Two 1.875MB app slots, so web/OTA updates keep working with Wi-Fi + Zigbee +
+# the web page in one image (the stock "Zigbee 4MB" layout only has 1.25MB),
+# plus the two partitions the Zigbee stack needs (zb_storage, zb_fct).
+# No SPIFFS: nothing uses a file system.
+# Name,     Type, SubType,  Offset,   Size,     Flags
+nvs,        data, nvs,      0x9000,   0x5000,
+otadata,    data, ota,      0xe000,   0x2000,
+app0,       app,  ota_0,    0x10000,  0x1E0000,
+app1,       app,  ota_1,    0x1F0000, 0x1E0000,
+zb_storage, data, fat,      0x3D0000, 0x4000,
+zb_fct,     data, fat,      0x3D4000, 0x1000,
+coredump,   data, coredump, 0x3E0000, 0x10000,

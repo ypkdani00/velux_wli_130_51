@@ -1,0 +1,35 @@
+{
+  // VS Code tasks for this sketch. Ctrl+Shift+B runs the default one.
+  // Both compile with PLATFORMIO_RUN_JOBS parallel jobs (settings.json), or
+  // one per logical CPU when that's not set - see export_release.ps1 -Jobs.
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "VELUX: build firmware -> ..\\build\\velux_wli_130_51_c6.bin",
+      "type": "process",
+      "command": "powershell.exe",
+      "args": ["-NoProfile", "-File", "${workspaceFolder}\\export_release.ps1"],
+      "options": { "cwd": "${workspaceFolder}" },
+      "group": { "kind": "build", "isDefault": true },
+      "problemMatcher": ["$platformio"],
+      "presentation": { "reveal": "always", "panel": "dedicated", "clear": true }
+    },
+    {
+      "label": "VELUX: build + flash over USB",
+      "type": "process",
+      "command": "powershell.exe",
+      "args": ["-NoProfile", "-File", "${workspaceFolder}\\export_release.ps1", "-Upload"],
+      "options": { "cwd": "${workspaceFolder}" },
+      "group": "build",
+      "problemMatcher": ["$platformio"],
+      "presentation": { "reveal": "always", "panel": "dedicated", "clear": true }
+    },
+    {
+      "label": "VELUX: regenerate WebUI_gz.h",
+      "type": "process",
+      "command": "node",
+      "args": ["${workspaceFolder}/tools/build_webui_gz.js"],
+      "problemMatcher": []
+    }
+  ]
+}
